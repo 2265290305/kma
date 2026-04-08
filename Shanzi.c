@@ -1888,13 +1888,21 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 			break;
 		}
 
+		#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
 		kaddr = kmap_local_page(page);
+		#else
+		kaddr = kmap(page);
+		#endif
 		if (copy_to_user((void __user *)(cmd.dst_va + done),
 				 (char *)kaddr + page_off, chunk))
 			ret = -EFAULT;
 		else
 			ret = 0;
+		#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
 		kunmap_local(kaddr);
+		#else
+		kunmap(page);
+		#endif
 		put_page(page);
 		if (ret)
 			break;

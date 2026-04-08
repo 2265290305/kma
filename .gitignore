@@ -6,6 +6,7 @@
 .*.cmd
 Module.symvers
 modules.order
+.thinlto-cache/
 driver_ko.zip
 5.10.sh
 5.15.sh
