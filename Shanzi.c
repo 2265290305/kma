@@ -30,10 +30,8 @@
 
 #ifdef SHANZI_RELEASE_BUILD
 #define SHZ_INFO(fmt, ...) do { } while (0)
-#define SHZ_ERR(fmt, ...) pr_err(fmt, ##__VA_ARGS__)
 #else
 #define SHZ_INFO(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
-#define SHZ_ERR(fmt, ...) pr_err(fmt, ##__VA_ARGS__)
 #endif
 
 struct paradise_get_pid_cmd {
@@ -256,93 +254,37 @@ static struct list_head *shanzi_module_prev;
 
 static long shanzi_ioctl_hwbp_remove(uint64_t handle);
 
-static char *shz_xor_dup(const unsigned char *enc, size_t len, unsigned char key)
+static void shanzi_xor_decode(char *buf, size_t len, unsigned char key)
 {
-	char *out;
 	size_t i;
 
-	out = kmalloc(len + 1, GFP_KERNEL);
-	if (!out)
-		return NULL;
-
 	for (i = 0; i < len; i++)
-		out[i] = enc[i] ^ key;
-	out[len] = '\0';
-	return out;
+		buf[i] ^= key;
 }
 
-static int shz_make_proc_path(char *buf, size_t size, uint32_t pid)
-{
-	static const unsigned char enc[] = {
-		0x2b, 0x74, 0x27, 0x39, 0x34, 0x36, 0x74, 0x70, 0x28
-	};
-	char *fmt = shz_xor_dup(enc, sizeof(enc), 0x04);
-	int ret;
-
-	if (!fmt)
-		return -ENOMEM;
-	ret = snprintf(buf, size, fmt, pid);
-	kfree(fmt);
-	return ret;
-}
-
-static int shz_make_cgroup_path(char *buf, size_t size, uint32_t pid)
-{
-	static const unsigned char enc[] = {
-		0x66, 0x2a, 0x2c, 0x2a, 0x66, 0x38, 0x3a, 0x66, 0x38, 0x3c,
-		0x2e, 0x39, 0x34, 0x22, 0x37, 0x66, 0x2c, 0x22, 0x31, 0x74,
-		0x35, 0x66, 0x35, 0x2e, 0x31, 0x74, 0x7c, 0x6a
-	};
-	char *fmt = shz_xor_dup(enc, sizeof(enc), 0x49);
-	int ret;
-
-	if (!fmt)
-		return -ENOMEM;
-	ret = snprintf(buf, size, fmt, pid);
-	kfree(fmt);
-	return ret;
-}
-
-static int shz_make_kgsl_path(char *buf, size_t size, uint32_t pid)
-{
-	static const unsigned char enc[] = {
-		0x13, 0x5e, 0x04, 0x0c, 0x13, 0x13, 0x12, 0x0c, 0x1f, 0x13,
-		0x13, 0x01, 0x1d, 0x06, 0x13, 0x12, 0x0c, 0x1f, 0x07, 0x14,
-		0x06, 0x13, 0x1f, 0x13, 0x07, 0x16, 0x5d, 0x47
-	};
-	char *fmt = shz_xor_dup(enc, sizeof(enc), 0x3c);
-	int ret;
-
-	if (!fmt)
-		return -ENOMEM;
-	ret = snprintf(buf, size, fmt, pid);
-	kfree(fmt);
-	return ret;
-}
+#define SHZ_DEC(name, key, ...)                         \
+	char name[] = { __VA_ARGS__ };                  \
+	shanzi_xor_decode(name, sizeof(name) - 1, key)
 
 static unsigned long shanzi_lookup_symbol(const char *name)
 {
-	static const unsigned char enc[] = {
-		0x20, 0x2a, 0x27, 0x27, 0x38, 0x32, 0x26, 0x34,
-		0x34, 0x3b, 0x3e, 0x0c, 0x27, 0x34, 0x34, 0x3e,
-		0x22, 0x25, 0x08, 0x23, 0x34, 0x38, 0x3e
+	SHZ_DEC(kallsyms_name, 0x5A,
+		'k'^0x5A,'a'^0x5A,'l'^0x5A,'l'^0x5A,'s'^0x5A,'y'^0x5A,
+		'm'^0x5A,'s'^0x5A,'_'^0x5A,'l'^0x5A,'o'^0x5A,'o'^0x5A,
+		'k'^0x5A,'u'^0x5A,'p'^0x5A,'_'^0x5A,'n'^0x5A,'a'^0x5A,
+		'm'^0x5A,'e'^0x5A, 0);
+	struct kprobe kp = {
+		.symbol_name = kallsyms_name,
 	};
-	char *sym;
-	struct kprobe kp = {};
 	unsigned long addr = 0;
 
 	if (shanzi_kallsyms_lookup_name)
 		return shanzi_kallsyms_lookup_name(name);
 
-	sym = shz_xor_dup(enc, sizeof(enc), 0x4b);
-	if (!sym)
-		return 0;
-	kp.symbol_name = sym;
 	if (register_kprobe(&kp) == 0) {
 		shanzi_kallsyms_lookup_name = (void *)kp.addr;
 		unregister_kprobe(&kp);
 	}
-	kfree(sym);
 	if (shanzi_kallsyms_lookup_name)
 		addr = shanzi_kallsyms_lookup_name(name);
 	return addr;
@@ -350,136 +292,43 @@ static unsigned long shanzi_lookup_symbol(const char *name)
 
 static int shanzi_resolve_hide_helpers(void)
 {
-	static const unsigned char enc_kern_path[] = {
-		0x5f, 0x51, 0x46, 0x5a, 0x0b, 0x44, 0x5a, 0x4f
-	};
-	static const unsigned char enc_path_put[] = {
-		0x44, 0x55, 0x40, 0x5c, 0x0b, 0x44, 0x40, 0x41
-	};
-	static const unsigned char enc_path_umount[] = {
-		0x69, 0x78, 0x6d, 0x71, 0x22, 0x6d, 0x71, 0x79,
-		0x5f, 0x79, 0x63, 0x62
-	};
-	static const unsigned char enc_path_mount[] = {
-		0x69, 0x78, 0x6d, 0x71, 0x22, 0x7f, 0x63, 0x71,
-		0x6c, 0x70
-	};
-	static const unsigned char enc_tasklist_lock[] = {
-		0x31, 0x24, 0x36, 0x2e, 0x29, 0x2c, 0x36, 0x31,
-		0x3a, 0x2a, 0x27, 0x2d, 0x3f
-	};
-	static const unsigned char enc_init_task[] = {
-		0x22, 0x25, 0x22, 0x3f, 0x34, 0x29, 0x3f, 0x2a,
-		0x38
-	};
-	char *sym;
+	SHZ_DEC(sym_kern_path, 0x31, 'k'^0x31,'e'^0x31,'r'^0x31,'n'^0x31,'_'^0x31,'p'^0x31,'a'^0x31,'t'^0x31,'h'^0x31,0);
+	SHZ_DEC(sym_path_put, 0x31, 'p'^0x31,'a'^0x31,'t'^0x31,'h'^0x31,'_'^0x31,'p'^0x31,'u'^0x31,'t'^0x31,0);
+	SHZ_DEC(sym_path_umount, 0x31, 'p'^0x31,'a'^0x31,'t'^0x31,'h'^0x31,'_'^0x31,'u'^0x31,'m'^0x31,'o'^0x31,'u'^0x31,'n'^0x31,'t'^0x31,0);
+	SHZ_DEC(sym_path_mount, 0x31, 'p'^0x31,'a'^0x31,'t'^0x31,'h'^0x31,'_'^0x31,'m'^0x31,'o'^0x31,'u'^0x31,'n'^0x31,'t'^0x31,0);
 
 	if (!shanzi_kern_path_fn)
-	{
-		sym = shz_xor_dup(enc_kern_path, sizeof(enc_kern_path), 0x34);
-		if (!sym)
-			return -ENOMEM;
-		shanzi_kern_path_fn = (void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
+		shanzi_kern_path_fn = (void *)shanzi_lookup_symbol(sym_kern_path);
 	if (!shanzi_path_put_fn)
-	{
-		sym = shz_xor_dup(enc_path_put, sizeof(enc_path_put), 0x34);
-		if (!sym)
-			return -ENOMEM;
-		shanzi_path_put_fn = (void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
+		shanzi_path_put_fn = (void *)shanzi_lookup_symbol(sym_path_put);
 	if (!shanzi_path_umount_fn)
-	{
-		sym = shz_xor_dup(enc_path_umount, sizeof(enc_path_umount), 0x19);
-		if (!sym)
-			return -ENOMEM;
-		shanzi_path_umount_fn = (void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
+		shanzi_path_umount_fn = (void *)shanzi_lookup_symbol(sym_path_umount);
 	if (!shanzi_path_mount_fn)
-	{
-		sym = shz_xor_dup(enc_path_mount, sizeof(enc_path_mount), 0x19);
-		if (!sym)
-			return -ENOMEM;
-		shanzi_path_mount_fn = (void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
+		shanzi_path_mount_fn = (void *)shanzi_lookup_symbol(sym_path_mount);
 
 	if (!shanzi_kern_path_fn || !shanzi_path_put_fn ||
 	    !shanzi_path_umount_fn || !shanzi_path_mount_fn)
 		return -ENOENT;
 
 	if (!shanzi_tasklist_lock_ptr)
-	{
-		sym = shz_xor_dup(enc_tasklist_lock, sizeof(enc_tasklist_lock), 0x45);
-		if (!sym)
-			return -ENOMEM;
-		shanzi_tasklist_lock_ptr = (void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
+		shanzi_tasklist_lock_ptr =
+			(void *)shanzi_lookup_symbol("tasklist_lock");
 	if (!shanzi_init_task_ptr)
-	{
-		sym = shz_xor_dup(enc_init_task, sizeof(enc_init_task), 0x4b);
-		if (!sym)
-			return -ENOMEM;
-		shanzi_init_task_ptr = (void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
+		shanzi_init_task_ptr = (void *)shanzi_lookup_symbol("init_task");
 	return 0;
 }
 
 static int shanzi_resolve_module_hide_helpers(void)
 {
-	static const unsigned char enc_module_mutex[] = {
-		0x3b, 0x35, 0x32, 0x23, 0x3a, 0x35, 0x2f, 0x3d,
-		0x3d, 0x23, 0x32, 0x29
-	};
-	char *sym;
-
+	SHZ_DEC(sym_module_mutex, 0x24, 'm'^0x24,'o'^0x24,'d'^0x24,'u'^0x24,'l'^0x24,'e'^0x24,'_'^0x24,'m'^0x24,'u'^0x24,'t'^0x24,'e'^0x24,'x'^0x24,0);
 	if (!shanzi_module_mutex_ptr)
-	{
-		sym = shz_xor_dup(enc_module_mutex, sizeof(enc_module_mutex), 0x56);
-		if (!sym)
-			return -ENOMEM;
-		shanzi_module_mutex_ptr = (void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
+		shanzi_module_mutex_ptr =
+			(void *)shanzi_lookup_symbol(sym_module_mutex);
 
 	if (!shanzi_module_mutex_ptr)
 		return -ENOENT;
 
 	return 0;
-}
-
-static int shanzi_resolve_task_helpers(void)
-{
-	static const unsigned char enc_tasklist_lock[] = {
-		0x31, 0x24, 0x36, 0x2e, 0x29, 0x2c, 0x36, 0x31,
-		0x3a, 0x2a, 0x27, 0x2d, 0x3f
-	};
-	static const unsigned char enc_init_task[] = {
-		0x22, 0x25, 0x22, 0x3f, 0x34, 0x29, 0x3f, 0x2a,
-		0x38
-	};
-	char *sym;
-
-	if (!shanzi_tasklist_lock_ptr) {
-		sym = shz_xor_dup(enc_tasklist_lock, sizeof(enc_tasklist_lock), 0x45);
-		if (!sym)
-			return -ENOMEM;
-		shanzi_tasklist_lock_ptr = (void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
-	if (!shanzi_init_task_ptr) {
-		sym = shz_xor_dup(enc_init_task, sizeof(enc_init_task), 0x4b);
-		if (!sym)
-			return -ENOMEM;
-		shanzi_init_task_ptr = (void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
-	return shanzi_tasklist_lock_ptr ? 0 : -ENOENT;
 }
 
 static long shanzi_set_module_hidden(bool hide)
@@ -550,33 +399,19 @@ static struct shanzi_hidden_proc *shanzi_find_hidden_proc(uint32_t pid)
 
 static int shanzi_hide_mount_tmpfs(const char *path)
 {
-	static const unsigned char enc_data[] = {
-		0x12, 0x0a, 0x01, 0x16, 0x4f, 0x5d, 0x42, 0x5a,
-		0x55, 0x56, 0x5c, 0x4f, 0x52, 0x5c
-	};
-	static const unsigned char enc_tmpfs[] = {
-		0x2d, 0x34, 0x28, 0x3f, 0x2d
-	};
 	struct path mount_path;
-	char *mount_data;
-	char *tmpfs;
+	SHZ_DEC(mount_data, 0x11,
+		's'^0x11,'i'^0x11,'z'^0x11,'e'^0x11,'='^0x11,'0'^0x11,','^0x11,
+		'm'^0x11,'o'^0x11,'d'^0x11,'e'^0x11,'='^0x11,'0'^0x11,'5'^0x11,
+		'5'^0x11,'5'^0x11,0);
+	SHZ_DEC(tmpfs_name, 0x22, 't'^0x22,'m'^0x22,'p'^0x22,'f'^0x22,'s'^0x22,0);
 	int ret;
 
 	ret = shanzi_kern_path_fn(path, LOOKUP_FOLLOW, &mount_path);
 	if (ret)
 		return ret;
 
-	mount_data = shz_xor_dup(enc_data, sizeof(enc_data), 0x61);
-	tmpfs = shz_xor_dup(enc_tmpfs, sizeof(enc_tmpfs), 0x59);
-	if (!mount_data || !tmpfs) {
-		kfree(mount_data);
-		kfree(tmpfs);
-		shanzi_path_put_fn(&mount_path);
-		return -ENOMEM;
-	}
-	ret = shanzi_path_mount_fn(tmpfs, &mount_path, tmpfs, 0, mount_data);
-	kfree(mount_data);
-	kfree(tmpfs);
+	ret = shanzi_path_mount_fn(tmpfs_name, &mount_path, tmpfs_name, 0, mount_data);
 	shanzi_path_put_fn(&mount_path);
 	return ret;
 }
@@ -614,15 +449,17 @@ static void shanzi_cleanup_hidden_proc(struct shanzi_hidden_proc *hidden)
 	}
 
 	if (hidden->proc_mounted) {
-		shz_make_proc_path(path_buf, sizeof(path_buf), hidden->pid);
+		snprintf(path_buf, sizeof(path_buf), "/proc/%u", hidden->pid);
 		shanzi_hide_umount_path(path_buf);
 	}
 	if (hidden->cgroup_mounted) {
-		shz_make_cgroup_path(path_buf, sizeof(path_buf), hidden->pid);
+		snprintf(path_buf, sizeof(path_buf),
+			 "/sys/fs/cgroup/uid_0/pid_%u", hidden->pid);
 		shanzi_hide_umount_path(path_buf);
 	}
 	if (hidden->kgsl_mounted) {
-		shz_make_kgsl_path(path_buf, sizeof(path_buf), hidden->pid);
+		snprintf(path_buf, sizeof(path_buf),
+			 "/sys/devices/virtual/kgsl/kgsl/proc/%u", hidden->pid);
 		shanzi_hide_umount_path(path_buf);
 	}
 
@@ -734,58 +571,32 @@ static long hello_ioctl_touch_set_mode(unsigned long arg)
 
 static int shanzi_resolve_hwbp_helpers(void)
 {
-	static const unsigned char enc_reg[] = {
-		0x27, 0x30, 0x32, 0x3c, 0x26, 0x21, 0x30, 0x27,
-		0x0a, 0x20, 0x26, 0x30, 0x27, 0x0a, 0x3d, 0x22,
-		0x17, 0x27, 0x30, 0x34, 0x3e, 0x25, 0x3a, 0x3c,
-		0x3b, 0x21
-	};
-	static const unsigned char enc_mod[] = {
-		0x72, 0x78, 0x79, 0x76, 0x7b, 0x65, 0x6c, 0x76,
-		0x6b, 0x6a, 0x65, 0x70, 0x6c, 0x76, 0x6b, 0x6a,
-		0x70, 0x63, 0x7a, 0x75, 0x76, 0x78, 0x72, 0x69,
-		0x76, 0x7a, 0x75
-	};
-	static const unsigned char enc_unreg[] = {
-		0x42, 0x41, 0x55, 0x52, 0x58, 0x5e, 0x44, 0x43,
-		0x52, 0x41, 0x68, 0x42, 0x44, 0x52, 0x41, 0x68,
-		0x5f, 0x40, 0x75, 0x41, 0x52, 0x56, 0x5c, 0x43,
-		0x5d, 0x58, 0x5e, 0x43
-	};
-	char *sym;
+	SHZ_DEC(sym_reg_hwbp, 0x4D,
+		'r'^0x4D,'e'^0x4D,'g'^0x4D,'i'^0x4D,'s'^0x4D,'t'^0x4D,'e'^0x4D,'r'^0x4D,'_'^0x4D,
+		'u'^0x4D,'s'^0x4D,'e'^0x4D,'r'^0x4D,'_'^0x4D,'h'^0x4D,'w'^0x4D,'_'^0x4D,
+		'b'^0x4D,'r'^0x4D,'e'^0x4D,'a'^0x4D,'k'^0x4D,'p'^0x4D,'o'^0x4D,'i'^0x4D,'n'^0x4D,'t'^0x4D,0);
+	SHZ_DEC(sym_mod_hwbp, 0x4D,
+		'm'^0x4D,'o'^0x4D,'d'^0x4D,'i'^0x4D,'f'^0x4D,'y'^0x4D,'_'^0x4D,
+		'u'^0x4D,'s'^0x4D,'e'^0x4D,'r'^0x4D,'_'^0x4D,'h'^0x4D,'w'^0x4D,'_'^0x4D,
+		'b'^0x4D,'r'^0x4D,'e'^0x4D,'a'^0x4D,'k'^0x4D,'p'^0x4D,'o'^0x4D,'i'^0x4D,'n'^0x4D,'t'^0x4D,0);
+	SHZ_DEC(sym_unreg_hwbp, 0x4D,
+		'u'^0x4D,'n'^0x4D,'r'^0x4D,'e'^0x4D,'g'^0x4D,'i'^0x4D,'s'^0x4D,'t'^0x4D,'e'^0x4D,'r'^0x4D,'_'^0x4D,
+		'h'^0x4D,'w'^0x4D,'_'^0x4D,'b'^0x4D,'r'^0x4D,'e'^0x4D,'a'^0x4D,'k'^0x4D,'p'^0x4D,'o'^0x4D,'i'^0x4D,'n'^0x4D,'t'^0x4D,0);
 
 	if (!shanzi_register_user_hw_breakpoint_fn)
-	{
-		sym = shz_xor_dup(enc_reg, sizeof(enc_reg), 0x55);
-		if (!sym)
-			return -ENOMEM;
 		shanzi_register_user_hw_breakpoint_fn =
-			(void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
+			(void *)shanzi_lookup_symbol(sym_reg_hwbp);
 	if (!shanzi_modify_user_hw_breakpoint_fn)
-	{
-		sym = shz_xor_dup(enc_mod, sizeof(enc_mod), 0x1f);
-		if (!sym)
-			return -ENOMEM;
 		shanzi_modify_user_hw_breakpoint_fn =
-			(void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
+			(void *)shanzi_lookup_symbol(sym_mod_hwbp);
 	if (!shanzi_unregister_hw_breakpoint_fn)
-	{
-		sym = shz_xor_dup(enc_unreg, sizeof(enc_unreg), 0x37);
-		if (!sym)
-			return -ENOMEM;
 		shanzi_unregister_hw_breakpoint_fn =
-			(void *)shanzi_lookup_symbol(sym);
-		kfree(sym);
-	}
+			(void *)shanzi_lookup_symbol(sym_unreg_hwbp);
 
 	if (!shanzi_register_user_hw_breakpoint_fn ||
 	    !shanzi_modify_user_hw_breakpoint_fn ||
 	    !shanzi_unregister_hw_breakpoint_fn) {
-		SHZ_ERR("hwbp resolve failed reg=%px mod=%px unreg=%px\n",
+		pr_err("Shanzi: hwbp helper resolve failed reg=%px mod=%px unreg=%px\n",
 		       shanzi_register_user_hw_breakpoint_fn,
 		       shanzi_modify_user_hw_breakpoint_fn,
 		       shanzi_unregister_hw_breakpoint_fn);
@@ -1009,20 +820,15 @@ static int find_process_by_name(const char *name)
 	size_t count = 0;
 	size_t i = 0;
 	int pid = 0;
-	int ret;
 
 	needle_len = strnlen(name, sizeof(((struct paradise_get_pid_cmd *)0)->name));
 	if (!needle_len)
 		return -EINVAL;
 
-	ret = shanzi_resolve_task_helpers();
-	if (ret)
-		return ret;
-
-	read_lock(shanzi_tasklist_lock_ptr);
+	read_lock(&tasklist_lock);
 	for_each_process(task)
 		count++;
-	read_unlock(shanzi_tasklist_lock_ptr);
+	read_unlock(&tasklist_lock);
 
 	if (!count)
 		return 0;
@@ -1031,14 +837,14 @@ static int find_process_by_name(const char *name)
 	if (!tasks)
 		return -ENOMEM;
 
-	read_lock(shanzi_tasklist_lock_ptr);
+	read_lock(&tasklist_lock);
 	for_each_process(task) {
 		if (i >= count)
 			break;
 		get_task_struct(task);
 		tasks[i++] = task;
 	}
-	read_unlock(shanzi_tasklist_lock_ptr);
+	read_unlock(&tasklist_lock);
 
 	count = i;
 	for (i = 0; i < count; i++) {
@@ -1425,17 +1231,11 @@ static long shanzi_ioctl_hwbp_add_process_bp(unsigned long arg)
 	if (!task)
 		return -ESRCH;
 
-	ret = shanzi_resolve_task_helpers();
-	if (ret) {
-		put_task_struct(task);
-		return ret;
-	}
-
-	read_lock(shanzi_tasklist_lock_ptr);
+	read_lock(&tasklist_lock);
 	thread_count = 1;
 	for_each_thread(task, iter)
 		thread_count++;
-	read_unlock(shanzi_tasklist_lock_ptr);
+	read_unlock(&tasklist_lock);
 
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
@@ -1471,7 +1271,7 @@ static long shanzi_ioctl_hwbp_add_process_bp(unsigned long arg)
 		return -ENOMEM;
 	}
 
-	read_lock(shanzi_tasklist_lock_ptr);
+	read_lock(&tasklist_lock);
 	get_task_struct(task);
 	threads[i++] = task;
 	for_each_thread(task, iter) {
@@ -1480,7 +1280,7 @@ static long shanzi_ioctl_hwbp_add_process_bp(unsigned long arg)
 		get_task_struct(iter);
 		threads[i++] = iter;
 	}
-	read_unlock(shanzi_tasklist_lock_ptr);
+	read_unlock(&tasklist_lock);
 	put_task_struct(task);
 	thread_count = i;
 
@@ -1504,7 +1304,7 @@ static long shanzi_ioctl_hwbp_add_process_bp(unsigned long arg)
 		put_task_struct(threads[i]);
 		if (IS_ERR(bp)) {
 			ret = PTR_ERR(bp);
-			SHZ_ERR("register hwbp failed pid=%llu idx=%u/%u addr=0x%llx err=%ld\n",
+			pr_err("Shanzi: register hwbp failed pid=%llu idx=%u/%u addr=0x%llx err=%ld\n",
 			       (unsigned long long)info->task_id, i, thread_count,
 			       (unsigned long long)cmd.address, ret);
 			break;
@@ -1606,7 +1406,7 @@ static long shanzi_ioctl_hwbp_toggle(unsigned long arg, bool enable)
 	for (i = 0; i < info->bp_count; i++) {
 		ret = shanzi_modify_user_hw_breakpoint_fn(info->bps[i], &attr);
 		if (ret) {
-			SHZ_ERR("Shanzi: %s hwbp handle=0x%llx idx=%u/%u err=%d\n",
+			pr_err("Shanzi: %s hwbp handle=0x%llx idx=%u/%u err=%d\n",
 			       enable ? "resume" : "suspend",
 			       (unsigned long long)cmd.value, i, info->bp_count,
 			       ret);
@@ -1969,17 +1769,19 @@ static long hello_ioctl_hide_process(unsigned long arg)
 	{
 		char path_buf[64];
 
-		shz_make_proc_path(path_buf, sizeof(path_buf), cmd.pid);
+		snprintf(path_buf, sizeof(path_buf), "/proc/%u", cmd.pid);
 		if (!shanzi_hide_mount_tmpfs(path_buf))
 			hidden->proc_mounted = true;
 		else
 			SHZ_INFO("Shanzi: hide: mount over %s failed\n", path_buf);
 
-		shz_make_cgroup_path(path_buf, sizeof(path_buf), cmd.pid);
+		snprintf(path_buf, sizeof(path_buf),
+			 "/sys/fs/cgroup/uid_0/pid_%u", cmd.pid);
 		if (!shanzi_hide_mount_tmpfs(path_buf))
 			hidden->cgroup_mounted = true;
 
-		shz_make_kgsl_path(path_buf, sizeof(path_buf), cmd.pid);
+		snprintf(path_buf, sizeof(path_buf),
+			 "/sys/devices/virtual/kgsl/kgsl/proc/%u", cmd.pid);
 		if (!shanzi_hide_mount_tmpfs(path_buf))
 			hidden->kgsl_mounted = true;
 	}
@@ -2165,6 +1967,6 @@ module_init(shanzi_init);
 module_exit(shanzi_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Shanzi");
-MODULE_DESCRIPTION("Shanzi kernel module");
+MODULE_AUTHOR("Codex");
+MODULE_DESCRIPTION("Shanzi driver with Paradise-compatible memory and HWBP ioctls");
 MODULE_VERSION("1.2");
