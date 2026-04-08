@@ -23,7 +23,6 @@
 #include <linux/namei.h>
 #include <linux/poll.h>
 #include <linux/proc_fs.h>
-#include <linux/version.h>
 #include <asm/cputype.h>
 #include <asm/hw_breakpoint.h>
 
@@ -1103,13 +1102,9 @@ static uintptr_t get_module_base(pid_t pid, const char *name, unsigned long vm_f
 	if (!mm)
 		return 0;
 
-	mmap_read_lock(mm);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	VMA_ITERATOR(vmi, mm, 0);
+	mmap_read_lock(mm);
 	for_each_vma(vmi, vma) {
-#else
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
-#endif
 		struct file *file;
 		const char *dname;
 		size_t match_len;
@@ -1169,13 +1164,8 @@ static long translate_process_vaddr(pid_t pid, uintptr_t vaddr, uintptr_t *phys_
 
 	offset = offset_in_page(vaddr);
 	mmap_read_lock(mm);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	ret = get_user_pages_remote(mm, vaddr & PAGE_MASK, 1, FOLL_FORCE, &page,
-				    &locked);
-#else
 	ret = get_user_pages_remote(mm, vaddr & PAGE_MASK, 1, FOLL_FORCE, &page,
 				    NULL, &locked);
-#endif
 	if (locked)
 		mmap_read_unlock(mm);
 	mmput(mm);
@@ -1869,13 +1859,8 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 		void *kaddr;
 
 		mmap_read_lock(mm);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-		ret = get_user_pages_remote(mm, cur & PAGE_MASK, 1, FOLL_FORCE,
-					    &page, &locked);
-#else
 		ret = get_user_pages_remote(mm, cur & PAGE_MASK, 1, FOLL_FORCE,
 					    &page, NULL, &locked);
-#endif
 		if (locked)
 			mmap_read_unlock(mm);
 		if (ret != 1 || !page) {
@@ -2127,11 +2112,7 @@ static int __init shanzi_init(void)
 	if (hello_major < 0)
 		return hello_major;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	hello_class = class_create(HELLO_DEVICE_NAME);
-#else
 	hello_class = class_create(THIS_MODULE, HELLO_DEVICE_NAME);
-#endif
 	if (IS_ERR(hello_class)) {
 		ret = PTR_ERR(hello_class);
 		goto err_chrdev;
