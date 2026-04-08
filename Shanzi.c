@@ -1165,7 +1165,7 @@ static long translate_process_vaddr(pid_t pid, uintptr_t vaddr, uintptr_t *phys_
 	offset = offset_in_page(vaddr);
 	mmap_read_lock(mm);
 	ret = get_user_pages_remote(mm, vaddr & PAGE_MASK, 1, FOLL_FORCE, &page,
-				    NULL, &locked);
+				    &locked);
 	if (locked)
 		mmap_read_unlock(mm);
 	mmput(mm);
@@ -1860,7 +1860,7 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 
 		mmap_read_lock(mm);
 		ret = get_user_pages_remote(mm, cur & PAGE_MASK, 1, FOLL_FORCE,
-					    &page, NULL, &locked);
+					    &page, &locked);
 		if (locked)
 			mmap_read_unlock(mm);
 		if (ret != 1 || !page) {
@@ -2112,7 +2112,7 @@ static int __init shanzi_init(void)
 	if (hello_major < 0)
 		return hello_major;
 
-	hello_class = class_create(THIS_MODULE, HELLO_DEVICE_NAME);
+	hello_class = class_create(HELLO_DEVICE_NAME);
 	if (IS_ERR(hello_class)) {
 		ret = PTR_ERR(hello_class);
 		goto err_chrdev;
