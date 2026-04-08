@@ -1,0 +1,14 @@
+*.ko
+*.o
+*.lto.o
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+driver_ko.zip
+5.10.sh
+5.15.sh
+6.1.sh
+6.6.sh
+6.12.sh
