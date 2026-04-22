@@ -27,6 +27,8 @@
 #include <asm/hw_breakpoint.h>
 
 #define HELLO_DEVICE_NAME "Shanzi"
+#define SHANZI_READ_STACK_BUF_SIZE 256
+#define SHANZI_READ_MAX_SIZE 0x10000
 
 #ifdef SHANZI_RELEASE_BUILD
 #define SHZ_INFO(fmt, ...) do { } while (0)
@@ -43,6 +45,7 @@ struct paradise_get_module_base_cmd {
 	pid_t pid;
 	char name[256];
 	uintptr_t base;
+	uintptr_t end;
 	int vm_flag;
 };
 
@@ -881,7 +884,8 @@ static int find_process_by_name(const char *name)
 	return pid;
 }
 
-static uintptr_t get_module_base(pid_t pid, const char *name, unsigned long vm_flag)
+static bool get_module_bounds(pid_t pid, const char *name, unsigned long vm_flag,
+			      uintptr_t *base_out, uintptr_t *end_out)
 {
 	struct pid *kpid;
 	struct task_struct *task;
@@ -889,24 +893,26 @@ static uintptr_t get_module_base(pid_t pid, const char *name, unsigned long vm_f
 	struct vm_area_struct *vma;
 	size_t needle_len;
 	uintptr_t base = 0;
+	uintptr_t end = 0;
+	bool found = false;
 
 	needle_len = strnlen(name, sizeof(((struct paradise_get_module_base_cmd *)0)->name));
 	if (!needle_len)
-		return 0;
+		return false;
 
 	kpid = find_get_pid(pid);
 	if (!kpid)
-		return 0;
+		return false;
 
 	task = get_pid_task(kpid, PIDTYPE_PID);
 	put_pid(kpid);
 	if (!task)
-		return 0;
+		return false;
 
 	mm = get_task_mm(task);
 	put_task_struct(task);
 	if (!mm)
-		return 0;
+		return false;
 
 	VMA_ITERATOR(vmi, mm, 0);
 	mmap_read_lock(mm);
@@ -932,14 +938,24 @@ static uintptr_t get_module_base(pid_t pid, const char *name, unsigned long vm_f
 			continue;
 
 		if (!bcmp(dname, name, match_len)) {
-			base = (uintptr_t)vma->vm_start;
-			break;
+			if (!found || (uintptr_t)vma->vm_start < base)
+				base = (uintptr_t)vma->vm_start;
+			if (!found || (uintptr_t)vma->vm_end > end)
+				end = (uintptr_t)vma->vm_end;
+			found = true;
 		}
 	}
 	mmap_read_unlock(mm);
 	mmput(mm);
 
-	return base;
+	if (!found)
+		return false;
+
+	if (base_out)
+		*base_out = base;
+	if (end_out)
+		*end_out = end;
+	return true;
 }
 
 static long translate_process_vaddr(pid_t pid, uintptr_t vaddr, uintptr_t *phys_out)
@@ -1591,17 +1607,18 @@ static long hello_ioctl_get_module_base(unsigned long arg)
 {
 	struct paradise_get_module_base_cmd cmd;
 	uintptr_t base;
+	uintptr_t end;
 
 	memset(&cmd, 0, sizeof(cmd));
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
 		return -EFAULT;
 
 	cmd.name[sizeof(cmd.name) - 1] = '\0';
-	base = get_module_base(cmd.pid, cmd.name, (unsigned long)cmd.vm_flag);
-	if (!base)
+	if (!get_module_bounds(cmd.pid, cmd.name, (unsigned long)cmd.vm_flag, &base, &end))
 		return -ENAVAIL;
 
 	cmd.base = base;
+	cmd.end = end;
 	if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd)))
 		return -EFAULT;
 
@@ -1616,8 +1633,13 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 	struct mm_struct *mm;
 	pgprot_t prot;
 	uintptr_t first_phys = 0;
+	void *bounce = NULL;
+	size_t bounce_size;
+	size_t buffered = 0;
+	size_t copied = 0;
 	size_t done = 0;
 	long ret = 0;
+	u8 stack_buf[SHANZI_READ_STACK_BUF_SIZE];
 
 	memset(&cmd, 0, sizeof(cmd));
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
@@ -1625,7 +1647,7 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 
 	if (cmd.pid <= 0 || !cmd.src_va || !cmd.dst_va || !cmd.size)
 		return -EINVAL;
-	if (cmd.size > PAGE_SIZE)
+	if (cmd.size > SHANZI_READ_MAX_SIZE)
 		return -EINVAL;
 	if (convert_wmt_to_pgprot(cmd.prot, &prot))
 		return -EINVAL;
@@ -1638,25 +1660,58 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 	if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd)))
 		return -EFAULT;
 
+	bounce_size = min_t(size_t, cmd.size, SHANZI_READ_MAX_SIZE);
+	if (bounce_size <= sizeof(stack_buf)) {
+		bounce = stack_buf;
+		bounce_size = sizeof(stack_buf);
+	} else {
+		bounce = kmalloc(bounce_size, GFP_KERNEL);
+		if (!bounce) {
+			bounce_size = PAGE_SIZE;
+			bounce = kmalloc(bounce_size, GFP_KERNEL);
+			if (!bounce)
+				return -ENOMEM;
+		}
+	}
+
 	kpid = find_get_pid(cmd.pid);
-	if (!kpid)
-		return -ESRCH;
+	if (!kpid) {
+		ret = -ESRCH;
+		goto out_free_bounce;
+	}
 	task = get_pid_task(kpid, PIDTYPE_PID);
 	put_pid(kpid);
-	if (!task)
-		return -ESRCH;
+	if (!task) {
+		ret = -ESRCH;
+		goto out_free_bounce;
+	}
 	mm = get_task_mm(task);
 	put_task_struct(task);
-	if (!mm)
-		return -ESRCH;
+	if (!mm) {
+		ret = -ESRCH;
+		goto out_free_bounce;
+	}
 
 	while (done < cmd.size) {
 		struct page *page = NULL;
 		uintptr_t cur = cmd.src_va + done;
 		size_t page_off = offset_in_page(cur);
 		size_t chunk = min_t(size_t, cmd.size - done, PAGE_SIZE - page_off);
+		size_t room = bounce_size - buffered;
 		int locked = 1;
 		void *kaddr;
+
+		if (chunk > room) {
+			if (copy_to_user((void __user *)(cmd.dst_va + copied), bounce, buffered)) {
+				ret = -EFAULT;
+				break;
+			}
+			copied += buffered;
+			buffered = 0;
+			room = bounce_size;
+		}
+		if (chunk > room)
+			chunk = room;
 
 		mmap_read_lock(mm);
 		ret = get_user_pages_remote(mm, cur & PAGE_MASK, 1, FOLL_FORCE,
@@ -1674,11 +1729,9 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 		}
 
 		kaddr = kmap_local_page(page);
-		if (copy_to_user((void __user *)(cmd.dst_va + done),
-				 (char *)kaddr + page_off, chunk))
-			ret = -EFAULT;
-		else
-			ret = 0;
+		memcpy((u8 *)bounce + buffered, (char *)kaddr + page_off, chunk);
+		buffered += chunk;
+		ret = 0;
 		kunmap_local(kaddr);
 		put_page(page);
 		if (ret)
@@ -1686,7 +1739,15 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 		done += chunk;
 	}
 
+	if (!ret && buffered) {
+		if (copy_to_user((void __user *)(cmd.dst_va + copied), bounce, buffered))
+			ret = -EFAULT;
+	}
+
 	mmput(mm);
+out_free_bounce:
+	if (bounce && bounce != stack_buf)
+		kfree(bounce);
 	return ret;
 }
 
