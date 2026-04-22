@@ -23,12 +23,17 @@
 #include <linux/namei.h>
 #include <linux/poll.h>
 #include <linux/proc_fs.h>
+#include <linux/input.h>
+#include <linux/vmalloc.h>
+#include <linux/smp.h>
 #include <asm/cputype.h>
 #include <asm/hw_breakpoint.h>
+#include <asm/tlbflush.h>
 
 #define HELLO_DEVICE_NAME "Shanzi"
 #define SHANZI_READ_STACK_BUF_SIZE 256
 #define SHANZI_READ_MAX_SIZE 0x10000
+#define SHANZI_PTE_POOL_SLOTS 32
 
 #ifdef SHANZI_RELEASE_BUILD
 #define SHZ_INFO(fmt, ...) do { } while (0)
@@ -222,6 +227,7 @@ static DEFINE_MUTEX(shanzi_hide_lock);
 static LIST_HEAD(shanzi_hidden_procs);
 static DEFINE_MUTEX(shanzi_module_hide_lock);
 static DEFINE_MUTEX(shanzi_ring_lock);
+static DEFINE_MUTEX(g_touch_lock);
 static DECLARE_WAIT_QUEUE_HEAD(shanzi_ring_waitq);
 static DEFINE_SPINLOCK(shanzi_hwbp_lock);
 static LIST_HEAD(shanzi_hwbp_handles);
@@ -230,6 +236,17 @@ static uint32_t shanzi_ring_head;
 static uint32_t shanzi_ring_tail;
 static atomic64_t shanzi_hook_pc = ATOMIC64_INIT(0);
 static int shanzi_touch_mode;
+static DEFINE_MUTEX(shanzi_pte_pool_lock);
+static bool shanzi_pte_pool_ready;
+
+struct shanzi_pte_slot {
+	void *va;
+	pte_t *pte;
+	pte_t saved_pte;
+	unsigned long mapped_pfn;
+};
+
+static struct shanzi_pte_slot shanzi_pte_pool[SHANZI_PTE_POOL_SLOTS];
 
 enum {
 	SHANZI_TOUCH_MODE_FOPS = 0,
@@ -254,6 +271,25 @@ static int (*shanzi_modify_user_hw_breakpoint_fn)(
 static void (*shanzi_unregister_hw_breakpoint_fn)(struct perf_event *bp);
 static bool shanzi_module_hidden;
 static struct list_head *shanzi_module_prev;
+static struct mm_struct *shanzi_init_mm_ptr;
+static struct mutex *shanzi_input_mutex_ptr;
+static struct list_head *shanzi_input_dev_list_ptr;
+static void (*shanzi_input_event_fn)(struct input_dev *dev,
+					 unsigned int type,
+					 unsigned int code,
+					 int value);
+static bool g_touch_initialized;
+static struct input_dev *g_touch_dev;
+
+struct shanzi_touch_slot_state {
+	bool active;
+	int tracking_id;
+	int x;
+	int y;
+};
+
+static struct shanzi_touch_slot_state g_active_touches[10];
+static int g_touch_next_tracking_id = 1;
 
 static long shanzi_ioctl_hwbp_remove(uint64_t handle);
 
@@ -518,6 +554,166 @@ static __maybe_unused int shanzi_ring_queue_push(uint32_t type, int32_t slot,
 	return 0;
 }
 
+static int shanzi_resolve_touch_helpers(void)
+{
+	SHZ_DEC(sym_input_dev_list, 0x33,
+		'i'^0x33,'n'^0x33,'p'^0x33,'u'^0x33,'t'^0x33,'_'^0x33,
+		'd'^0x33,'e'^0x33,'v'^0x33,'_'^0x33,'l'^0x33,'i'^0x33,
+		's'^0x33,'t'^0x33,0);
+	SHZ_DEC(sym_input_mutex, 0x33,
+		'i'^0x33,'n'^0x33,'p'^0x33,'u'^0x33,'t'^0x33,'_'^0x33,
+		'm'^0x33,'u'^0x33,'t'^0x33,'e'^0x33,'x'^0x33,0);
+	SHZ_DEC(sym_input_event, 0x33,
+		'i'^0x33,'n'^0x33,'p'^0x33,'u'^0x33,'t'^0x33,'_'^0x33,
+		'e'^0x33,'v'^0x33,'e'^0x33,'n'^0x33,'t'^0x33,0);
+
+	if (!shanzi_input_dev_list_ptr)
+		shanzi_input_dev_list_ptr = (struct list_head *)shanzi_lookup_symbol(sym_input_dev_list);
+	if (!shanzi_input_mutex_ptr)
+		shanzi_input_mutex_ptr = (struct mutex *)shanzi_lookup_symbol(sym_input_mutex);
+	if (!shanzi_input_event_fn)
+		shanzi_input_event_fn = (void *)shanzi_lookup_symbol(sym_input_event);
+
+	if (!shanzi_input_dev_list_ptr || !shanzi_input_mutex_ptr || !shanzi_input_event_fn)
+		return -ENOENT;
+	return 0;
+}
+
+static struct input_dev *shanzi_find_touch_device_locked(void)
+{
+	struct input_dev *dev;
+	struct input_dev *best = NULL;
+	int best_area = -1;
+
+	if (!shanzi_input_dev_list_ptr)
+		return NULL;
+
+	list_for_each_entry(dev, shanzi_input_dev_list_ptr, node) {
+		int max_x;
+		int max_y;
+		int area;
+
+		if (!test_bit(EV_ABS, dev->evbit) || !dev->absinfo)
+			continue;
+		if (!test_bit(ABS_MT_POSITION_X, dev->absbit) ||
+		    !test_bit(ABS_MT_POSITION_Y, dev->absbit))
+			continue;
+
+		max_x = dev->absinfo[ABS_MT_POSITION_X].maximum;
+		max_y = dev->absinfo[ABS_MT_POSITION_Y].maximum;
+		if (max_x <= 0 || max_y <= 0)
+			continue;
+
+		area = max_x * max_y;
+		if (area > best_area) {
+			best = dev;
+			best_area = area;
+		}
+	}
+
+	return best;
+}
+
+static int shanzi_touch_init_if_needed(void)
+{
+	int ret;
+
+	if (g_touch_initialized && g_touch_dev)
+		return 0;
+
+	ret = shanzi_resolve_touch_helpers();
+	if (ret)
+		return ret;
+
+	mutex_lock(&g_touch_lock);
+	if (!g_touch_initialized || !g_touch_dev) {
+		mutex_lock(shanzi_input_mutex_ptr);
+		g_touch_dev = shanzi_find_touch_device_locked();
+		mutex_unlock(shanzi_input_mutex_ptr);
+		if (!g_touch_dev) {
+			mutex_unlock(&g_touch_lock);
+			return -ENODEV;
+		}
+		memset(g_active_touches, 0, sizeof(g_active_touches));
+		g_touch_next_tracking_id = 1;
+		g_touch_initialized = true;
+	}
+	mutex_unlock(&g_touch_lock);
+	return 0;
+}
+
+static void shanzi_emit_touch_sync_locked(void)
+{
+	bool any_active = false;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(g_active_touches); i++) {
+		if (g_active_touches[i].active) {
+			any_active = true;
+			break;
+		}
+	}
+
+	shanzi_input_event_fn(g_touch_dev, EV_KEY, BTN_TOUCH, any_active ? 1 : 0);
+	shanzi_input_event_fn(g_touch_dev, EV_KEY, BTN_TOOL_FINGER, any_active ? 1 : 0);
+	shanzi_input_event_fn(g_touch_dev, EV_SYN, SYN_REPORT, 0);
+}
+
+static long shanzi_touch_inject_event(uint32_t type, int32_t slot, int32_t x, int32_t y)
+{
+	struct shanzi_touch_slot_state *touch;
+	int ret;
+
+	if (slot < 0 || slot >= ARRAY_SIZE(g_active_touches))
+		return -EINVAL;
+
+	ret = shanzi_touch_init_if_needed();
+	if (ret)
+		return ret;
+
+	mutex_lock(&g_touch_lock);
+	touch = &g_active_touches[slot];
+	shanzi_input_event_fn(g_touch_dev, EV_ABS, ABS_MT_SLOT, slot);
+
+	switch (type) {
+	case 0:
+		if (!touch->active) {
+			touch->tracking_id = g_touch_next_tracking_id++;
+			touch->active = true;
+		}
+		touch->x = x;
+		touch->y = y;
+		shanzi_input_event_fn(g_touch_dev, EV_ABS, ABS_MT_TRACKING_ID, touch->tracking_id);
+		shanzi_input_event_fn(g_touch_dev, EV_ABS, ABS_MT_POSITION_X, x);
+		shanzi_input_event_fn(g_touch_dev, EV_ABS, ABS_MT_POSITION_Y, y);
+		break;
+	case 1:
+		if (touch->active) {
+			shanzi_input_event_fn(g_touch_dev, EV_ABS, ABS_MT_TRACKING_ID, -1);
+			touch->active = false;
+			touch->tracking_id = 0;
+		}
+		break;
+	case 2:
+		if (!touch->active) {
+			mutex_unlock(&g_touch_lock);
+			return -EINVAL;
+		}
+		touch->x = x;
+		touch->y = y;
+		shanzi_input_event_fn(g_touch_dev, EV_ABS, ABS_MT_POSITION_X, x);
+		shanzi_input_event_fn(g_touch_dev, EV_ABS, ABS_MT_POSITION_Y, y);
+		break;
+	default:
+		mutex_unlock(&g_touch_lock);
+		return -EINVAL;
+	}
+
+	shanzi_emit_touch_sync_locked();
+	mutex_unlock(&g_touch_lock);
+	return 0;
+}
+
 static long hello_ioctl_touch_down(unsigned long arg)
 {
 	struct paradise_touch_down_cmd cmd = {};
@@ -526,9 +722,10 @@ static long hello_ioctl_touch_down(unsigned long arg)
 		return -EFAULT;
 	if (cmd.slot < 0 || cmd.slot > 9)
 		return -EINVAL;
-	if (shanzi_touch_mode != 1)
-		return 0;
-	return shanzi_ring_queue_push(0, cmd.slot, cmd.x, cmd.y);
+	if (shanzi_touch_mode == SHANZI_TOUCH_MODE_RING ||
+	    shanzi_touch_mode == SHANZI_TOUCH_MODE_RING_HOOK)
+		return shanzi_ring_queue_push(0, cmd.slot, cmd.x, cmd.y);
+	return shanzi_touch_inject_event(0, cmd.slot, cmd.x, cmd.y);
 }
 
 static long hello_ioctl_touch_move(unsigned long arg)
@@ -539,9 +736,10 @@ static long hello_ioctl_touch_move(unsigned long arg)
 		return -EFAULT;
 	if (cmd.slot < 0 || cmd.slot > 9)
 		return -EINVAL;
-	if (shanzi_touch_mode != 1)
-		return 0;
-	return shanzi_ring_queue_push(2, cmd.slot, cmd.x, cmd.y);
+	if (shanzi_touch_mode == SHANZI_TOUCH_MODE_RING ||
+	    shanzi_touch_mode == SHANZI_TOUCH_MODE_RING_HOOK)
+		return shanzi_ring_queue_push(2, cmd.slot, cmd.x, cmd.y);
+	return shanzi_touch_inject_event(2, cmd.slot, cmd.x, cmd.y);
 }
 
 static long hello_ioctl_touch_up(unsigned long arg)
@@ -552,9 +750,10 @@ static long hello_ioctl_touch_up(unsigned long arg)
 		return -EFAULT;
 	if (cmd.slot < 0 || cmd.slot > 9)
 		return -EINVAL;
-	if (shanzi_touch_mode != 1)
-		return 0;
-	return shanzi_ring_queue_push(1, cmd.slot, 0, 0);
+	if (shanzi_touch_mode == SHANZI_TOUCH_MODE_RING ||
+	    shanzi_touch_mode == SHANZI_TOUCH_MODE_RING_HOOK)
+		return shanzi_ring_queue_push(1, cmd.slot, 0, 0);
+	return shanzi_touch_inject_event(1, cmd.slot, 0, 0);
 }
 
 static long hello_ioctl_touch_set_mode(unsigned long arg)
@@ -997,6 +1196,132 @@ static long translate_process_vaddr(pid_t pid, uintptr_t vaddr, uintptr_t *phys_
 	*phys_out = page_to_phys(page) + offset;
 	put_page(page);
 	return 0;
+}
+
+static void shanzi_free_pte_slot(struct shanzi_pte_slot *slot)
+{
+	if (!slot || !slot->va || !slot->pte)
+		return;
+
+	set_pte(slot->pte, slot->saved_pte);
+	flush_tlb_kernel_range((unsigned long)slot->va,
+			       (unsigned long)slot->va + PAGE_SIZE);
+	vfree(slot->va);
+	slot->va = NULL;
+	slot->pte = NULL;
+	slot->mapped_pfn = ULONG_MAX;
+}
+
+static void shanzi_pte_phys_cleanup(void)
+{
+	int cpu;
+
+	mutex_lock(&shanzi_pte_pool_lock);
+	shanzi_pte_pool_ready = false;
+	for_each_possible_cpu(cpu) {
+		if (cpu >= SHANZI_PTE_POOL_SLOTS)
+			break;
+		shanzi_free_pte_slot(&shanzi_pte_pool[cpu]);
+	}
+	mutex_unlock(&shanzi_pte_pool_lock);
+}
+
+static int shanzi_pte_pool_ensure(void)
+{
+	int cpu;
+
+	mutex_lock(&shanzi_pte_pool_lock);
+	if (shanzi_pte_pool_ready) {
+		mutex_unlock(&shanzi_pte_pool_lock);
+		return 0;
+	}
+	if (!shanzi_init_mm_ptr && shanzi_kallsyms_lookup_name)
+		shanzi_init_mm_ptr = (struct mm_struct *)shanzi_kallsyms_lookup_name("init_mm");
+	if (!shanzi_init_mm_ptr) {
+		mutex_unlock(&shanzi_pte_pool_lock);
+		return -ENOENT;
+	}
+
+	for_each_possible_cpu(cpu) {
+		struct shanzi_pte_slot *slot;
+		unsigned long addr;
+		pgd_t *pgd;
+		p4d_t *p4d;
+		pud_t *pud;
+		pmd_t *pmd;
+
+		if (cpu >= SHANZI_PTE_POOL_SLOTS)
+			break;
+		slot = &shanzi_pte_pool[cpu];
+		slot->mapped_pfn = ULONG_MAX;
+		slot->va = vzalloc(PAGE_SIZE);
+		if (!slot->va)
+			goto err;
+
+		addr = (unsigned long)slot->va;
+		pgd = pgd_offset(shanzi_init_mm_ptr, addr);
+		if (pgd_none(*pgd) || pgd_bad(*pgd))
+			goto err;
+		p4d = p4d_offset(pgd, addr);
+		if (p4d_none(*p4d) || p4d_bad(*p4d))
+			goto err;
+		pud = pud_offset(p4d, addr);
+		if (pud_none(*pud) || pud_bad(*pud))
+			goto err;
+		pmd = pmd_offset(pud, addr);
+		if (pmd_none(*pmd) || pmd_bad(*pmd))
+			goto err;
+		slot->pte = pte_offset_kernel(pmd, addr);
+		if (!slot->pte)
+			goto err;
+		slot->saved_pte = READ_ONCE(*slot->pte);
+	}
+
+	shanzi_pte_pool_ready = true;
+	mutex_unlock(&shanzi_pte_pool_lock);
+	return 0;
+err:
+	while (--cpu >= 0)
+		shanzi_free_pte_slot(&shanzi_pte_pool[cpu]);
+	mutex_unlock(&shanzi_pte_pool_lock);
+	return -ENOMEM;
+}
+
+static void *shanzi_map_phys_page(unsigned long phys, size_t *page_off_out)
+{
+	unsigned long pfn = phys >> PAGE_SHIFT;
+	int cpu;
+	struct shanzi_pte_slot *slot;
+
+	if (!shanzi_pte_pool_ready || !pfn_valid(pfn))
+		return NULL;
+
+	*page_off_out = offset_in_page(phys);
+	cpu = get_cpu();
+	if (cpu >= SHANZI_PTE_POOL_SLOTS) {
+		put_cpu();
+		return NULL;
+	}
+
+	slot = &shanzi_pte_pool[cpu];
+	if (!slot->va || !slot->pte) {
+		put_cpu();
+		return NULL;
+	}
+
+	if (slot->mapped_pfn != pfn) {
+		set_pte(slot->pte, pfn_pte(pfn, PAGE_KERNEL));
+		flush_tlb_kernel_range((unsigned long)slot->va,
+				       (unsigned long)slot->va + PAGE_SIZE);
+		slot->mapped_pfn = pfn;
+	}
+
+	return (char *)slot->va + *page_off_out;
+}
+
+static void shanzi_unmap_phys_page(void)
+{
+	put_cpu();
 }
 
 static struct shanzi_proc_handle *shanzi_find_proc_handle(uint64_t handle)
@@ -1660,6 +1985,10 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 	if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd)))
 		return -EFAULT;
 
+	ret = shanzi_pte_pool_ensure();
+	if (ret)
+		return ret;
+
 	bounce_size = min_t(size_t, cmd.size, SHANZI_READ_MAX_SIZE);
 	if (bounce_size <= sizeof(stack_buf)) {
 		bounce = stack_buf;
@@ -1693,14 +2022,14 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 	}
 
 	while (done < cmd.size) {
-		struct page *page = NULL;
 		uintptr_t cur = cmd.src_va + done;
-		size_t page_off = offset_in_page(cur);
-		size_t chunk = min_t(size_t, cmd.size - done, PAGE_SIZE - page_off);
+		uintptr_t cur_phys = 0;
+		size_t page_off = 0;
+		size_t chunk;
 		size_t room = bounce_size - buffered;
-		int locked = 1;
 		void *kaddr;
 
+		chunk = min_t(size_t, cmd.size - done, PAGE_SIZE);
 		if (chunk > room) {
 			if (copy_to_user((void __user *)(cmd.dst_va + copied), bounce, buffered)) {
 				ret = -EFAULT;
@@ -1713,27 +2042,25 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 		if (chunk > room)
 			chunk = room;
 
-		mmap_read_lock(mm);
-		ret = get_user_pages_remote(mm, cur & PAGE_MASK, 1, FOLL_FORCE,
-					    &page, &locked);
-		if (locked)
-			mmap_read_unlock(mm);
-		if (ret != 1 || !page) {
-			ret = -EFAULT;
+		ret = translate_process_vaddr(cmd.pid, cur, &cur_phys);
+		if (ret)
 			break;
-		}
-		if (!pfn_valid(page_to_pfn(page))) {
-			put_page(page);
+
+		page_off = offset_in_page(cur_phys);
+		chunk = min_t(size_t, cmd.size - done, PAGE_SIZE - page_off);
+		if (chunk > room)
+			chunk = room;
+
+		kaddr = shanzi_map_phys_page(cur_phys, &page_off);
+		if (!kaddr) {
 			ret = -EFAULT;
 			break;
 		}
 
-		kaddr = kmap_local_page(page);
-		memcpy((u8 *)bounce + buffered, (char *)kaddr + page_off, chunk);
+		memcpy((u8 *)bounce + buffered, kaddr, chunk);
+		shanzi_unmap_phys_page();
 		buffered += chunk;
 		ret = 0;
-		kunmap_local(kaddr);
-		put_page(page);
 		if (ret)
 			break;
 		done += chunk;
@@ -1951,6 +2278,10 @@ static int hello_release(struct inode *inode, struct file *file)
 	shanzi_cleanup_all_hwbp();
 	shanzi_cleanup_all_proc_handles();
 	shanzi_cleanup_all_hidden_procs();
+	shanzi_pte_phys_cleanup();
+	memset(g_active_touches, 0, sizeof(g_active_touches));
+	g_touch_initialized = false;
+	g_touch_dev = NULL;
 	atomic64_set(&shanzi_hook_pc, 0);
 	return 0;
 }
@@ -2021,6 +2352,10 @@ static void __exit shanzi_exit(void)
 	shanzi_cleanup_all_hwbp();
 	shanzi_cleanup_all_proc_handles();
 	shanzi_cleanup_all_hidden_procs();
+	shanzi_pte_phys_cleanup();
+	memset(g_active_touches, 0, sizeof(g_active_touches));
+	g_touch_initialized = false;
+	g_touch_dev = NULL;
 	SHZ_INFO("Shanzi: module unloaded\n");
 }
 
