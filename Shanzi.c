@@ -1157,7 +1157,7 @@ static bool get_module_bounds(pid_t pid, const char *name, unsigned long vm_flag
 	return true;
 }
 
-static long translate_process_vaddr(pid_t pid, uintptr_t vaddr, uintptr_t *phys_out)
+static long lockfree_va_to_pa(pid_t pid, uintptr_t vaddr, uintptr_t *phys_out)
 {
 	struct pid *kpid;
 	struct task_struct *task;
@@ -1950,7 +1950,7 @@ static long hello_ioctl_get_module_base(unsigned long arg)
 	return 0;
 }
 
-static long hello_ioctl_read_memory_fast(unsigned long arg)
+static long do_read_physical_memory(unsigned long arg)
 {
 	struct paradise_memory_fast_cmd cmd;
 	struct pid *kpid;
@@ -1977,7 +1977,7 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 	if (convert_wmt_to_pgprot(cmd.prot, &prot))
 		return -EINVAL;
 
-	ret = translate_process_vaddr(cmd.pid, cmd.src_va, &first_phys);
+	ret = lockfree_va_to_pa(cmd.pid, cmd.src_va, &first_phys);
 	if (ret)
 		return ret;
 
@@ -2042,7 +2042,7 @@ static long hello_ioctl_read_memory_fast(unsigned long arg)
 		if (chunk > room)
 			chunk = room;
 
-		ret = translate_process_vaddr(cmd.pid, cur, &cur_phys);
+		ret = lockfree_va_to_pa(cmd.pid, cur, &cur_phys);
 		if (ret)
 			break;
 
@@ -2187,7 +2187,7 @@ static long hello_unlocked_ioctl(struct file *file, unsigned int cmd,
 {
 	switch (cmd) {
 	case PARADISE_IOCTL_READ_MEMORY_FAST:
-		return hello_ioctl_read_memory_fast(arg);
+		return do_read_physical_memory(arg);
 	case PARADISE_IOCTL_HIDE_PROCESS:
 		return hello_ioctl_hide_process(arg);
 	case SHANZI_IOCTL_HIDE_MODULE:
