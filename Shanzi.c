@@ -614,6 +614,12 @@ static long shanzi_emulate_ptrace_setregset(pid_t tgid, pid_t tid,
 	if (slot_count > max_slots)
 		ret = -ENOSPC;
 
+	SHZ_INFO("Shanzi: fake hwdebug set tgid=%d tid=%d kind=%s copy_len=%zu slots=%u max=%u ret=%ld first=[0x%llx/0x%x]\n",
+		 tgid, tid, is_break ? "break" : "watch", copy_len,
+		 slot_count, max_slots, ret,
+		 slot_count ? (unsigned long long)regs[0].addr : 0ULL,
+		 slot_count ? regs[0].ctrl : 0U);
+
 	return ret;
 }
 
@@ -664,6 +670,11 @@ static long shanzi_emulate_ptrace_getregset(pid_t tgid, pid_t tid,
 		return -EFAULT;
 
 	iov.iov_len = copy_len;
+	SHZ_INFO("Shanzi: fake hwdebug get tgid=%d tid=%d kind=%s copy_len=%zu info=0x%x first=[0x%llx/0x%x]\n",
+		 tgid, tid, is_break ? "break" : "watch", copy_len,
+		 local.dbg_info,
+		 (unsigned long long)local.dbg_regs[0].addr,
+		 local.dbg_regs[0].ctrl);
 	return shanzi_ptrace_hwdebug_write_iov(uiov, &iov);
 }
 
