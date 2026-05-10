@@ -20,14 +20,18 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/dcache.h>
+#include <linux/elf.h>
 #include <linux/namei.h>
 #include <linux/poll.h>
 #include <linux/proc_fs.h>
 #include <linux/input.h>
+#include <linux/ptrace.h>
+#include <linux/uio.h>
 #include <linux/vmalloc.h>
 #include <linux/smp.h>
 #include <asm/cputype.h>
 #include <asm/hw_breakpoint.h>
+#include <asm/ptrace.h>
 #include <asm/tlbflush.h>
 
 #define HELLO_DEVICE_NAME "Shanzi"
@@ -187,6 +191,7 @@ struct shanzi_ring_event {
 	_IOWR('W', 40, struct shanzi_hwbp_u64_cmd)
 
 #define SHANZI_HWBP_MAX_HITS 128
+#define SHANZI_HWDEBUG_MAX_SLOTS 16
 #define SHANZI_RING_CAPACITY 256
 
 struct shanzi_proc_handle {
@@ -202,6 +207,29 @@ struct shanzi_hidden_proc {
 	bool proc_mounted;
 	bool cgroup_mounted;
 	bool kgsl_mounted;
+};
+
+struct shanzi_hw_reg_state {
+	uint64_t addr;
+	uint32_t ctrl;
+};
+
+struct shanzi_user_bp_stat {
+	struct list_head link;
+	pid_t tgid;
+	pid_t tid;
+	uint32_t break_info;
+	uint32_t watch_info;
+	uint32_t break_slot_count;
+	uint32_t watch_slot_count;
+	struct shanzi_hw_reg_state break_regs[SHANZI_HWDEBUG_MAX_SLOTS];
+	struct shanzi_hw_reg_state watch_regs[SHANZI_HWDEBUG_MAX_SLOTS];
+};
+
+struct shanzi_virtual_target {
+	struct list_head link;
+	pid_t tgid;
+	uint32_t refs;
 };
 
 struct shanzi_hwbp_handle_info {
@@ -230,7 +258,11 @@ static DEFINE_MUTEX(shanzi_ring_lock);
 static DEFINE_MUTEX(g_touch_lock);
 static DECLARE_WAIT_QUEUE_HEAD(shanzi_ring_waitq);
 static DEFINE_SPINLOCK(shanzi_hwbp_lock);
+static DEFINE_SPINLOCK(shanzi_bp_stat_lock);
+static DEFINE_SPINLOCK(shanzi_virtual_target_lock);
 static LIST_HEAD(shanzi_hwbp_handles);
+static LIST_HEAD(shanzi_bp_stats);
+static LIST_HEAD(shanzi_virtual_targets);
 static struct shanzi_ring_event shanzi_ring_q[SHANZI_RING_CAPACITY];
 static uint32_t shanzi_ring_head;
 static uint32_t shanzi_ring_tail;
@@ -280,6 +312,8 @@ static void (*shanzi_input_event_fn)(struct input_dev *dev,
 					 int value);
 static bool g_touch_initialized;
 static struct input_dev *g_touch_dev;
+static struct kprobe shanzi_arch_ptrace_kp;
+static bool shanzi_arch_ptrace_hooked;
 
 struct shanzi_touch_slot_state {
 	bool active;
@@ -292,6 +326,435 @@ static struct shanzi_touch_slot_state g_active_touches[10];
 static int g_touch_next_tracking_id = 1;
 
 static long shanzi_ioctl_hwbp_remove(uint64_t handle);
+static int shanzi_get_num_brps(void);
+static int shanzi_get_num_wrps(void);
+
+static uint32_t shanzi_hwdebug_slot_count(const struct shanzi_hw_reg_state *regs,
+				  uint32_t max_slots)
+{
+	uint32_t i;
+	uint32_t used = 0;
+
+	if (!regs)
+		return 0;
+
+	for (i = 0; i < max_slots; i++) {
+		if (regs[i].addr || regs[i].ctrl)
+			used = i + 1;
+	}
+
+	return used;
+}
+
+static uint32_t shanzi_hwdebug_info_value(bool is_break)
+{
+	uint32_t debug_arch = read_cpuid(ID_AA64DFR0_EL1) & 0xfU;
+	uint32_t slots = is_break ? shanzi_get_num_brps() : shanzi_get_num_wrps();
+
+	if (slots > SHANZI_HWDEBUG_MAX_SLOTS)
+		slots = SHANZI_HWDEBUG_MAX_SLOTS;
+
+	return (debug_arch << 8) | slots;
+}
+
+static struct shanzi_user_bp_stat *
+shanzi_find_bp_stat_locked(pid_t tgid, pid_t tid)
+{
+	struct shanzi_user_bp_stat *entry;
+
+	list_for_each_entry(entry, &shanzi_bp_stats, link) {
+		if (entry->tgid == tgid && entry->tid == tid)
+			return entry;
+	}
+
+	return NULL;
+}
+
+static struct shanzi_user_bp_stat *
+shanzi_find_or_create_bp_stat(pid_t tgid, pid_t tid)
+{
+	struct shanzi_user_bp_stat *entry;
+	struct shanzi_user_bp_stat *fresh;
+	unsigned long flags;
+
+	spin_lock_irqsave(&shanzi_bp_stat_lock, flags);
+	entry = shanzi_find_bp_stat_locked(tgid, tid);
+	spin_unlock_irqrestore(&shanzi_bp_stat_lock, flags);
+	if (entry)
+		return entry;
+
+	fresh = kzalloc(sizeof(*fresh), GFP_ATOMIC);
+	if (!fresh)
+		return NULL;
+
+	fresh->tgid = tgid;
+	fresh->tid = tid;
+	fresh->break_info = shanzi_hwdebug_info_value(true);
+	fresh->watch_info = shanzi_hwdebug_info_value(false);
+
+	spin_lock_irqsave(&shanzi_bp_stat_lock, flags);
+	entry = shanzi_find_bp_stat_locked(tgid, tid);
+	if (!entry) {
+		list_add_tail(&fresh->link, &shanzi_bp_stats);
+		entry = fresh;
+		fresh = NULL;
+	}
+	spin_unlock_irqrestore(&shanzi_bp_stat_lock, flags);
+
+	kfree(fresh);
+	return entry;
+}
+
+static void shanzi_cleanup_all_bp_stats(void)
+{
+	struct shanzi_user_bp_stat *entry;
+	struct shanzi_user_bp_stat *tmp;
+	LIST_HEAD(garbage);
+	unsigned long flags;
+
+	spin_lock_irqsave(&shanzi_bp_stat_lock, flags);
+	list_splice_init(&shanzi_bp_stats, &garbage);
+	spin_unlock_irqrestore(&shanzi_bp_stat_lock, flags);
+
+	list_for_each_entry_safe(entry, tmp, &garbage, link) {
+		list_del(&entry->link);
+		kfree(entry);
+	}
+}
+
+static struct shanzi_virtual_target *
+shanzi_find_virtual_target_locked(pid_t tgid)
+{
+	struct shanzi_virtual_target *entry;
+
+	list_for_each_entry(entry, &shanzi_virtual_targets, link) {
+		if (entry->tgid == tgid)
+			return entry;
+	}
+
+	return NULL;
+}
+
+static void shanzi_virtual_target_get(pid_t tgid)
+{
+	struct shanzi_virtual_target *entry;
+	struct shanzi_virtual_target *fresh;
+	unsigned long flags;
+
+	spin_lock_irqsave(&shanzi_virtual_target_lock, flags);
+	entry = shanzi_find_virtual_target_locked(tgid);
+	if (entry) {
+		entry->refs++;
+		spin_unlock_irqrestore(&shanzi_virtual_target_lock, flags);
+		return;
+	}
+	spin_unlock_irqrestore(&shanzi_virtual_target_lock, flags);
+
+	fresh = kzalloc(sizeof(*fresh), GFP_KERNEL);
+	if (!fresh)
+		return;
+
+	fresh->tgid = tgid;
+	fresh->refs = 1;
+
+	spin_lock_irqsave(&shanzi_virtual_target_lock, flags);
+	entry = shanzi_find_virtual_target_locked(tgid);
+	if (entry) {
+		entry->refs++;
+		spin_unlock_irqrestore(&shanzi_virtual_target_lock, flags);
+		kfree(fresh);
+		return;
+	}
+	list_add_tail(&fresh->link, &shanzi_virtual_targets);
+	spin_unlock_irqrestore(&shanzi_virtual_target_lock, flags);
+}
+
+static void shanzi_virtual_target_put(pid_t tgid)
+{
+	struct shanzi_virtual_target *entry;
+	unsigned long flags;
+
+	spin_lock_irqsave(&shanzi_virtual_target_lock, flags);
+	entry = shanzi_find_virtual_target_locked(tgid);
+	if (!entry) {
+		spin_unlock_irqrestore(&shanzi_virtual_target_lock, flags);
+		return;
+	}
+
+	if (--entry->refs == 0) {
+		list_del(&entry->link);
+		spin_unlock_irqrestore(&shanzi_virtual_target_lock, flags);
+		kfree(entry);
+		return;
+	}
+	spin_unlock_irqrestore(&shanzi_virtual_target_lock, flags);
+}
+
+static bool shanzi_virtual_target_active(pid_t tgid)
+{
+	struct shanzi_virtual_target *entry;
+	unsigned long flags;
+	bool found = false;
+
+	spin_lock_irqsave(&shanzi_virtual_target_lock, flags);
+	entry = shanzi_find_virtual_target_locked(tgid);
+	if (entry && entry->refs)
+		found = true;
+	spin_unlock_irqrestore(&shanzi_virtual_target_lock, flags);
+	return found;
+}
+
+static void shanzi_cleanup_all_virtual_targets(void)
+{
+	struct shanzi_virtual_target *entry;
+	struct shanzi_virtual_target *tmp;
+	LIST_HEAD(garbage);
+	unsigned long flags;
+
+	spin_lock_irqsave(&shanzi_virtual_target_lock, flags);
+	list_splice_init(&shanzi_virtual_targets, &garbage);
+	spin_unlock_irqrestore(&shanzi_virtual_target_lock, flags);
+
+	list_for_each_entry_safe(entry, tmp, &garbage, link) {
+		list_del(&entry->link);
+		kfree(entry);
+	}
+}
+
+static int shanzi_ptrace_hwdebug_read_iov(struct iovec __user *uiov,
+				  struct iovec *iov)
+{
+	if (!uiov || !iov)
+		return -EINVAL;
+
+	if (copy_from_user_nofault(iov, uiov, sizeof(*iov)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int shanzi_ptrace_hwdebug_write_iov(struct iovec __user *uiov,
+				   const struct iovec *iov)
+{
+	if (!uiov || !iov)
+		return -EINVAL;
+
+	if (copy_to_user_nofault(uiov, iov, sizeof(*iov)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long shanzi_emulate_ptrace_setregset(pid_t tgid, pid_t tid,
+				    unsigned long note_type,
+				    struct iovec __user *uiov)
+{
+	struct user_hwdebug_state local;
+	struct iovec iov;
+	struct shanzi_user_bp_stat *stat;
+	struct shanzi_hw_reg_state *regs;
+	uint32_t slot_count;
+	uint32_t max_slots;
+	size_t copy_len;
+	size_t reg_bytes = 0;
+	uint32_t slots_to_copy = 0;
+	unsigned long flags;
+	bool is_break;
+	uint32_t i;
+	long ret = 0;
+
+	ret = shanzi_ptrace_hwdebug_read_iov(uiov, &iov);
+	if (ret)
+		return ret;
+
+	if (iov.iov_len % sizeof(uint32_t))
+		return -EINVAL;
+
+	copy_len = min_t(size_t, iov.iov_len, sizeof(local));
+	memset(&local, 0, sizeof(local));
+	if (copy_len && copy_from_user_nofault(&local, iov.iov_base, copy_len))
+		return -EFAULT;
+
+	iov.iov_len = copy_len;
+	ret = shanzi_ptrace_hwdebug_write_iov(uiov, &iov);
+	if (ret)
+		return ret;
+
+	if (copy_len > offsetof(struct user_hwdebug_state, dbg_regs))
+		reg_bytes = copy_len - offsetof(struct user_hwdebug_state, dbg_regs);
+	slots_to_copy = min_t(uint32_t, reg_bytes / sizeof(local.dbg_regs[0]),
+			      SHANZI_HWDEBUG_MAX_SLOTS);
+
+	stat = shanzi_find_or_create_bp_stat(tgid, tid);
+	if (!stat)
+		return -ENOMEM;
+
+	is_break = note_type == NT_ARM_HW_BREAK;
+	max_slots = is_break ? shanzi_get_num_brps() : shanzi_get_num_wrps();
+	if (max_slots > SHANZI_HWDEBUG_MAX_SLOTS)
+		max_slots = SHANZI_HWDEBUG_MAX_SLOTS;
+
+	spin_lock_irqsave(&shanzi_bp_stat_lock, flags);
+	regs = is_break ? stat->break_regs : stat->watch_regs;
+	for (i = 0; i < slots_to_copy; i++) {
+		regs[i].addr = local.dbg_regs[i].addr;
+		regs[i].ctrl = local.dbg_regs[i].ctrl;
+	}
+
+	slot_count = shanzi_hwdebug_slot_count(regs, SHANZI_HWDEBUG_MAX_SLOTS);
+	if (is_break) {
+		stat->break_info = shanzi_hwdebug_info_value(true);
+		stat->break_slot_count = slot_count;
+	} else {
+		stat->watch_info = shanzi_hwdebug_info_value(false);
+		stat->watch_slot_count = slot_count;
+	}
+	spin_unlock_irqrestore(&shanzi_bp_stat_lock, flags);
+
+	if (slot_count > max_slots)
+		ret = -ENOSPC;
+
+	return ret;
+}
+
+static long shanzi_emulate_ptrace_getregset(pid_t tgid, pid_t tid,
+				    unsigned long note_type,
+				    struct iovec __user *uiov)
+{
+	struct user_hwdebug_state local;
+	struct iovec iov;
+	struct shanzi_user_bp_stat *stat;
+	const struct shanzi_hw_reg_state *regs;
+	size_t copy_len;
+	unsigned long flags;
+	bool is_break;
+	uint32_t i;
+	long ret;
+
+	ret = shanzi_ptrace_hwdebug_read_iov(uiov, &iov);
+	if (ret)
+		return ret;
+
+	if (iov.iov_len % sizeof(uint32_t))
+		return -EINVAL;
+
+	copy_len = min_t(size_t, iov.iov_len, sizeof(local));
+	memset(&local, 0, sizeof(local));
+
+	stat = shanzi_find_or_create_bp_stat(tgid, tid);
+	if (!stat)
+		return -ENOMEM;
+
+	is_break = note_type == NT_ARM_HW_BREAK;
+	spin_lock_irqsave(&shanzi_bp_stat_lock, flags);
+	if (is_break) {
+		local.dbg_info = stat->break_info;
+		regs = stat->break_regs;
+	} else {
+		local.dbg_info = stat->watch_info;
+		regs = stat->watch_regs;
+	}
+	for (i = 0; i < SHANZI_HWDEBUG_MAX_SLOTS; i++) {
+		local.dbg_regs[i].addr = regs[i].addr;
+		local.dbg_regs[i].ctrl = regs[i].ctrl;
+	}
+	spin_unlock_irqrestore(&shanzi_bp_stat_lock, flags);
+
+	if (copy_len && copy_to_user_nofault(iov.iov_base, &local, copy_len))
+		return -EFAULT;
+
+	iov.iov_len = copy_len;
+	return shanzi_ptrace_hwdebug_write_iov(uiov, &iov);
+}
+
+static long shanzi_emulate_ptrace_hwdebug(struct task_struct *child,
+				  long request,
+				  unsigned long note_type,
+				  unsigned long data)
+{
+	pid_t tgid;
+	pid_t tid;
+
+	if (!child)
+		return -EINVAL;
+
+	tgid = task_tgid_nr(child);
+	if (!shanzi_virtual_target_active(tgid))
+		return LONG_MIN;
+
+	tid = task_pid_nr(child);
+	if (request == PTRACE_SETREGSET)
+		return shanzi_emulate_ptrace_setregset(tgid, tid, note_type,
+					       (struct iovec __user *)data);
+	if (request == PTRACE_GETREGSET)
+		return shanzi_emulate_ptrace_getregset(tgid, tid, note_type,
+					       (struct iovec __user *)data);
+
+	return LONG_MIN;
+}
+
+static int shanzi_skip_kprobe_with_ret(struct pt_regs *regs, long ret)
+{
+	regs->regs[0] = ret;
+	regs->pc = regs->regs[30];
+	return 1;
+}
+
+static int shanzi_arch_ptrace_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	struct task_struct *child;
+	long request;
+	unsigned long note_type;
+	unsigned long data;
+	long ret;
+
+	child = (struct task_struct *)regs->regs[0];
+	request = (long)regs->regs[1];
+	note_type = regs->regs[2];
+	data = regs->regs[3];
+
+	if (request != PTRACE_GETREGSET && request != PTRACE_SETREGSET)
+		return 0;
+	if (note_type != NT_ARM_HW_BREAK && note_type != NT_ARM_HW_WATCH)
+		return 0;
+
+	ret = shanzi_emulate_ptrace_hwdebug(child, request, note_type, data);
+	if (ret == LONG_MIN)
+		return 0;
+
+	SHZ_INFO("Shanzi: ptrace virtualized req=%ld tgid=%d tid=%d type=0x%lx ret=%ld\n",
+		 request, child ? task_tgid_nr(child) : -1,
+		 child ? task_pid_nr(child) : -1, note_type, ret);
+	return shanzi_skip_kprobe_with_ret(regs, ret);
+}
+
+static int shanzi_install_ptrace_virtualization(void)
+{
+	int ret;
+
+	memset(&shanzi_arch_ptrace_kp, 0, sizeof(shanzi_arch_ptrace_kp));
+	shanzi_arch_ptrace_kp.symbol_name = "arch_ptrace";
+	shanzi_arch_ptrace_kp.pre_handler = shanzi_arch_ptrace_pre;
+
+	ret = register_kprobe(&shanzi_arch_ptrace_kp);
+	if (ret) {
+		pr_err("Shanzi: arch_ptrace kprobe register failed: %d\n", ret);
+		return ret;
+	}
+
+	shanzi_arch_ptrace_hooked = true;
+	SHZ_INFO("Shanzi: ptrace hwdebug virtualization active\n");
+	return 0;
+}
+
+static void shanzi_remove_ptrace_virtualization(void)
+{
+	if (!shanzi_arch_ptrace_hooked)
+		return;
+
+	unregister_kprobe(&shanzi_arch_ptrace_kp);
+	shanzi_arch_ptrace_hooked = false;
+}
 
 static void shanzi_xor_decode(char *buf, size_t len, unsigned char key)
 {
@@ -1661,6 +2124,7 @@ static long shanzi_ioctl_hwbp_add_process_bp(unsigned long arg)
 	spin_lock_irqsave(&shanzi_hwbp_lock, flags);
 	list_add_tail(&info->link, &shanzi_hwbp_handles);
 	spin_unlock_irqrestore(&shanzi_hwbp_lock, flags);
+	shanzi_virtual_target_get((pid_t)info->task_id);
 	SHZ_INFO("Shanzi: add hwbp success pid=%llu addr=0x%llx installed=%u handle=0x%llx\n",
 		(unsigned long long)info->task_id,
 		(unsigned long long)cmd.address, info->bp_count,
@@ -1697,6 +2161,7 @@ static long shanzi_ioctl_hwbp_remove(uint64_t handle)
 	if (!info)
 		return -ENOENT;
 
+	shanzi_virtual_target_put((pid_t)info->task_id);
 	shanzi_hwbp_put(info);
 	shanzi_hwbp_put(info);
 	wait_for_completion(&info->released);
@@ -1881,6 +2346,7 @@ static void shanzi_cleanup_all_hwbp(void)
 		info->removing = true;
 		list_del(&info->link);
 		spin_unlock_irqrestore(&shanzi_hwbp_lock, flags);
+		shanzi_virtual_target_put((pid_t)info->task_id);
 
 		shanzi_hwbp_put(info);
 		shanzi_hwbp_put(info);
@@ -2278,6 +2744,7 @@ static int hello_release(struct inode *inode, struct file *file)
 	shanzi_cleanup_all_hwbp();
 	shanzi_cleanup_all_proc_handles();
 	shanzi_cleanup_all_hidden_procs();
+	shanzi_cleanup_all_virtual_targets();
 	shanzi_pte_phys_cleanup();
 	memset(g_active_touches, 0, sizeof(g_active_touches));
 	g_touch_initialized = false;
@@ -2320,6 +2787,8 @@ static int __init shanzi_init(void)
 	}
 
 	shanzi_hide_module_auto();
+	if (shanzi_install_ptrace_virtualization())
+		SHZ_INFO("Shanzi: ptrace virtualization unavailable, continuing without it\n");
 	SHZ_INFO("Shanzi: loaded, device /dev/%s ready\n", HELLO_DEVICE_NAME);
 	return 0;
 
@@ -2346,12 +2815,15 @@ static void __exit shanzi_exit(void)
 		mutex_unlock(&shanzi_module_hide_lock);
 	}
 
+	shanzi_remove_ptrace_virtualization();
 	device_destroy(hello_class, MKDEV(hello_major, 0));
 	class_destroy(hello_class);
 	unregister_chrdev(hello_major, HELLO_DEVICE_NAME);
 	shanzi_cleanup_all_hwbp();
 	shanzi_cleanup_all_proc_handles();
 	shanzi_cleanup_all_hidden_procs();
+	shanzi_cleanup_all_virtual_targets();
+	shanzi_cleanup_all_bp_stats();
 	shanzi_pte_phys_cleanup();
 	memset(g_active_touches, 0, sizeof(g_active_touches));
 	g_touch_initialized = false;
