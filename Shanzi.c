@@ -406,6 +406,9 @@ struct shanzi_virtual_target {
 	static bool g_touch_initialized;
 	static struct input_dev *g_touch_dev;
 
+	static struct kprobe shanzi_perf_event_open_kp;
+	static bool shanzi_perf_event_open_hooked;
+	static atomic64_t shanzi_fake_perf_next_id = ATOMIC64_INIT(1);
 	static struct kprobe shanzi_arch_ptrace_kp;
 	static bool shanzi_arch_ptrace_hooked;
 
@@ -420,6 +423,7 @@ struct shanzi_virtual_target {
 		SHANZI_SUPERCALL_ABI_PTREGS,
 	};
 
+	static enum shanzi_supercall_abi shanzi_perf_event_open_abi;
 	static enum shanzi_supercall_abi shanzi_reboot_abi;
 	static bool shanzi_reboot_kp_registered;
 	static int (*shanzi_task_work_add_fn)(struct task_struct *task,
@@ -429,6 +433,27 @@ struct shanzi_virtual_target {
 	struct shanzi_install_fd_work {
 		struct callback_head work;
 		int __user *out_fd;
+	};
+
+	struct shanzi_fake_perf_ctx {
+		struct perf_event_attr attr;
+		struct perf_event_mmap_page *meta_page;
+		u64 id;
+		u64 count;
+		u64 period;
+		u64 enable_start_ns;
+		u64 running_start_ns;
+		u64 total_enabled_ns;
+		u64 total_running_ns;
+		u64 time_zero_ns;
+		pid_t pid;
+		int cpu;
+		int group_fd;
+		unsigned long flags;
+		bool enabled;
+		bool paused;
+		bool bpf_attached;
+		bool filter_attached;
 	};
 
 	struct shanzi_touch_slot_state {
@@ -444,6 +469,12 @@ struct shanzi_virtual_target {
 	static long shanzi_ioctl_hwbp_remove(uint64_t handle);
 	static int shanzi_get_num_brps(void);
 	static int shanzi_get_num_wrps(void);
+	static bool shanzi_virtual_target_active(pid_t tgid);
+	static int shanzi_prepare_fake_perf_file(void);
+	static void shanzi_cleanup_fake_perf_file(void);
+	static long shanzi_install_fake_perf_fd(const struct perf_event_attr *attr,
+					 pid_t pid, int cpu, int group_fd,
+					 unsigned long flags);
 
 	static uint32_t
 	shanzi_hwdebug_slot_count(const struct shanzi_hw_reg_state *regs,
@@ -473,6 +504,68 @@ struct shanzi_virtual_target {
 			slots = SHANZI_HWDEBUG_MAX_SLOTS;
 
 		return (debug_arch << 8) | slots;
+	}
+
+	static u64 shanzi_hwbp_len_to_size(u64 bp_len)
+	{
+		switch (bp_len) {
+		case HW_BREAKPOINT_LEN_1:
+			return 1;
+		case HW_BREAKPOINT_LEN_2:
+			return 2;
+		case HW_BREAKPOINT_LEN_4:
+			return 4;
+		case HW_BREAKPOINT_LEN_8:
+			return 8;
+		default:
+			return 0;
+		}
+	}
+
+	static bool shanzi_hwbp_range_overlap(u64 a_addr, u64 a_len, u64 b_addr,
+				      u64 b_len)
+	{
+		u64 a_size;
+		u64 b_size;
+		u64 a_end;
+		u64 b_end;
+
+		a_size = shanzi_hwbp_len_to_size(a_len);
+		b_size = shanzi_hwbp_len_to_size(b_len);
+		if (!a_size || !b_size)
+			return false;
+
+		a_end = a_addr + a_size;
+		if (a_end < a_addr)
+			a_end = U64_MAX;
+		b_end = b_addr + b_size;
+		if (b_end < b_addr)
+			b_end = U64_MAX;
+
+		return a_addr < b_end && b_addr < a_end;
+	}
+
+	static bool shanzi_perf_bp_should_virtualize_locked(
+		pid_t target_tgid, const struct perf_event_attr *attr)
+	{
+		struct shanzi_hwbp_handle_info *info;
+
+		if (!attr || attr->type != PERF_TYPE_BREAKPOINT ||
+		    attr->bp_type != HW_BREAKPOINT_X)
+			return false;
+
+		list_for_each_entry(info, &shanzi_hwbp_handles, link) {
+			if (info->removing || (pid_t)info->task_id != target_tgid)
+				continue;
+			if (info->original_attr.bp_type != HW_BREAKPOINT_X)
+				continue;
+			if (shanzi_hwbp_range_overlap(attr->bp_addr, attr->bp_len,
+						      info->original_attr.bp_addr,
+						      info->original_attr.bp_len))
+				return true;
+		}
+
+		return false;
 	}
 
 	static struct shanzi_user_bp_stat *
@@ -842,6 +935,168 @@ struct shanzi_virtual_target {
 		regs->regs[0] = ret;
 		regs->pc = regs->regs[30];
 		return 1;
+	}
+
+	static bool shanzi_read_perf_event_attr(
+		struct perf_event_attr __user *uattr, struct perf_event_attr *attr)
+	{
+		size_t copy_len;
+
+		if (!uattr || !attr)
+			return false;
+
+		memset(attr, 0, sizeof(*attr));
+		if (copy_from_user_nofault(attr, uattr, sizeof(uint64_t)))
+			return false;
+
+		copy_len = min_t(size_t, attr->size, sizeof(*attr));
+		if (copy_len < offsetof(struct perf_event_attr, bp_len) +
+				      sizeof(attr->bp_len))
+			return false;
+		if (copy_len > sizeof(uint64_t) &&
+		    copy_from_user_nofault((char *)attr + sizeof(uint64_t),
+					    (char __user *)uattr + sizeof(uint64_t),
+					    copy_len - sizeof(uint64_t)))
+			return false;
+
+		return true;
+	}
+
+	static pid_t shanzi_perf_event_target_tgid(pid_t pid)
+	{
+		struct task_struct *task;
+		pid_t tgid = -1;
+
+		if (pid == 0)
+			return task_tgid_nr(current);
+		if (pid < 0)
+			return -1;
+
+		read_lock(&tasklist_lock);
+		task = pid_task(find_vpid(pid), PIDTYPE_PID);
+		if (task)
+			tgid = task_tgid_nr(task);
+		read_unlock(&tasklist_lock);
+		return tgid;
+	}
+
+	static long shanzi_emulate_perf_event_open(
+		struct perf_event_attr __user *uattr, pid_t pid, int cpu,
+		int group_fd, unsigned long flags)
+	{
+		struct perf_event_attr attr;
+		pid_t target_tgid;
+		unsigned long irqflags;
+		long fd;
+
+		if (!shanzi_read_perf_event_attr(uattr, &attr))
+			return LONG_MIN;
+
+		target_tgid = shanzi_perf_event_target_tgid(pid);
+		if (target_tgid <= 0 || !shanzi_virtual_target_active(target_tgid))
+			return LONG_MIN;
+
+		spin_lock_irqsave(&shanzi_hwbp_lock, irqflags);
+		if (!shanzi_perf_bp_should_virtualize_locked(target_tgid, &attr)) {
+			spin_unlock_irqrestore(&shanzi_hwbp_lock, irqflags);
+			return LONG_MIN;
+		}
+		spin_unlock_irqrestore(&shanzi_hwbp_lock, irqflags);
+
+		fd = shanzi_install_fake_perf_fd(&attr, pid, cpu, group_fd, flags);
+		if (fd < 0)
+			return LONG_MIN;
+
+		SHZ_INFO(
+			"Shanzi: perf_event_open virtualized tgid=%d pid=%d cpu=%d group_fd=%d flags=0x%lx addr=0x%llx len=%llu fd=%ld\n",
+			target_tgid, pid, cpu, group_fd, flags,
+			(unsigned long long)attr.bp_addr,
+			(unsigned long long)attr.bp_len, fd);
+		return fd;
+	}
+
+	static int shanzi_perf_event_open_pre(struct kprobe *p,
+					struct pt_regs *regs)
+	{
+		struct pt_regs *sys_regs = regs;
+		struct perf_event_attr __user *uattr;
+		pid_t pid;
+		int cpu;
+		int group_fd;
+		unsigned long flags;
+		long ret;
+
+		if (shanzi_perf_event_open_abi == SHANZI_SUPERCALL_ABI_PTREGS) {
+			sys_regs = (struct pt_regs *)regs->regs[0];
+			if (!sys_regs)
+				return 0;
+		}
+
+		uattr = (struct perf_event_attr __user *)sys_regs->regs[0];
+		pid = (pid_t)sys_regs->regs[1];
+		cpu = (int)sys_regs->regs[2];
+		group_fd = (int)sys_regs->regs[3];
+		flags = sys_regs->regs[4];
+
+		ret = shanzi_emulate_perf_event_open(uattr, pid, cpu, group_fd,
+					     flags);
+		if (ret == LONG_MIN)
+			return 0;
+
+		return shanzi_skip_kprobe_with_ret(regs, ret);
+	}
+
+	static int shanzi_install_perf_event_virtualization(void)
+	{
+		static const struct {
+			const char *symbol;
+			enum shanzi_supercall_abi abi;
+		} candidates[] = {
+			{ "__arm64_sys_perf_event_open", SHANZI_SUPERCALL_ABI_PTREGS },
+			{ "__se_sys_perf_event_open", SHANZI_SUPERCALL_ABI_DIRECT },
+			{ "__do_sys_perf_event_open", SHANZI_SUPERCALL_ABI_DIRECT },
+		};
+		int ret = -ENOENT;
+		size_t i;
+
+		ret = shanzi_prepare_fake_perf_file();
+		if (ret) {
+			pr_err("Shanzi: fake perf file prepare failed: %d\n", ret);
+			return ret;
+		}
+
+		memset(&shanzi_perf_event_open_kp, 0,
+		       sizeof(shanzi_perf_event_open_kp));
+		shanzi_perf_event_open_kp.pre_handler =
+			shanzi_perf_event_open_pre;
+
+		for (i = 0; i < ARRAY_SIZE(candidates); i++) {
+			shanzi_perf_event_open_kp.symbol_name = candidates[i].symbol;
+			ret = register_kprobe(&shanzi_perf_event_open_kp);
+			if (ret)
+				continue;
+
+			shanzi_perf_event_open_abi = candidates[i].abi;
+			shanzi_perf_event_open_hooked = true;
+			SHZ_INFO(
+				"Shanzi: perf_event_open virtualization active via %s\n",
+				candidates[i].symbol);
+			return 0;
+		}
+
+		shanzi_cleanup_fake_perf_file();
+		pr_err("Shanzi: perf_event_open kprobe register failed: %d\n", ret);
+		return ret;
+	}
+
+	static void shanzi_remove_perf_event_virtualization(void)
+	{
+		if (shanzi_perf_event_open_hooked) {
+			unregister_kprobe(&shanzi_perf_event_open_kp);
+			shanzi_perf_event_open_hooked = false;
+		}
+
+		shanzi_cleanup_fake_perf_file();
 	}
 
 	static int shanzi_arch_ptrace_pre(struct kprobe *p,
@@ -3807,6 +4062,351 @@ out_free:
 #endif
 	};
 
+	static void shanzi_fake_perf_sync_time(struct shanzi_fake_perf_ctx *ctx)
+	{
+		u64 now;
+		u64 enabled_ns;
+		u64 running_ns;
+
+		if (!ctx)
+			return;
+
+		now = ktime_get_ns();
+		enabled_ns = ctx->total_enabled_ns;
+		running_ns = ctx->total_running_ns;
+
+		if (ctx->enabled && ctx->enable_start_ns)
+			enabled_ns += now - ctx->enable_start_ns;
+		if (ctx->enabled && !ctx->paused && ctx->running_start_ns)
+			running_ns += now - ctx->running_start_ns;
+
+		if (ctx->meta_page) {
+			ctx->meta_page->time_enabled = enabled_ns;
+			ctx->meta_page->time_running = running_ns;
+			ctx->meta_page->time_zero = ctx->time_zero_ns;
+		}
+	}
+
+	static void shanzi_fake_perf_set_enabled(struct shanzi_fake_perf_ctx *ctx,
+					   bool enabled)
+	{
+		u64 now;
+
+		if (!ctx || ctx->enabled == enabled)
+			return;
+
+		now = ktime_get_ns();
+		if (enabled) {
+			ctx->enabled = true;
+			ctx->enable_start_ns = now;
+			if (!ctx->paused)
+				ctx->running_start_ns = now;
+		} else {
+			if (ctx->enable_start_ns)
+				ctx->total_enabled_ns += now - ctx->enable_start_ns;
+			if (!ctx->paused && ctx->running_start_ns)
+				ctx->total_running_ns += now - ctx->running_start_ns;
+			ctx->enabled = false;
+			ctx->enable_start_ns = 0;
+			ctx->running_start_ns = 0;
+		}
+		shanzi_fake_perf_sync_time(ctx);
+	}
+
+	static void shanzi_fake_perf_set_paused(struct shanzi_fake_perf_ctx *ctx,
+					  bool paused)
+	{
+		u64 now;
+
+		if (!ctx || ctx->paused == paused)
+			return;
+
+		now = ktime_get_ns();
+		if (paused) {
+			if (ctx->enabled && ctx->running_start_ns)
+				ctx->total_running_ns += now - ctx->running_start_ns;
+			ctx->running_start_ns = 0;
+			ctx->paused = true;
+		} else {
+			ctx->paused = false;
+			if (ctx->enabled)
+				ctx->running_start_ns = now;
+		}
+		shanzi_fake_perf_sync_time(ctx);
+	}
+
+	static int shanzi_fake_perf_mmap(struct file *file,
+				   struct vm_area_struct *vma)
+	{
+		struct shanzi_fake_perf_ctx *ctx = file->private_data;
+		unsigned long size;
+		unsigned long pfn;
+
+		if (!ctx || !ctx->meta_page)
+			return -EINVAL;
+
+		shanzi_fake_perf_sync_time(ctx);
+		size = vma->vm_end - vma->vm_start;
+		if (size != PAGE_SIZE || vma->vm_pgoff != 0)
+			return -EINVAL;
+
+		pfn = virt_to_phys(ctx->meta_page) >> PAGE_SHIFT;
+		vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+		if (remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE,
+				    vma->vm_page_prot))
+			return -EAGAIN;
+
+		return 0;
+	}
+
+	static ssize_t shanzi_fake_perf_read(struct file *file, char __user *buf,
+				 size_t count, loff_t *ppos)
+	{
+		struct shanzi_fake_perf_ctx *ctx = file->private_data;
+		u64 values[8];
+		size_t words = 0;
+		size_t bytes;
+
+		if (!ctx)
+			return -EINVAL;
+		if (*ppos)
+			return 0;
+
+		shanzi_fake_perf_sync_time(ctx);
+		if (ctx->attr.read_format & PERF_FORMAT_GROUP) {
+			values[words++] = 1;
+			if (ctx->attr.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
+				values[words++] = ctx->meta_page ? ctx->meta_page->time_enabled : 0;
+			if (ctx->attr.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
+				values[words++] = ctx->meta_page ? ctx->meta_page->time_running : 0;
+			values[words++] = ctx->count;
+			if (ctx->attr.read_format & PERF_FORMAT_ID)
+				values[words++] = ctx->id;
+			if (ctx->attr.read_format & PERF_FORMAT_LOST)
+				values[words++] = 0;
+		} else {
+			values[words++] = ctx->count;
+			if (ctx->attr.read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
+				values[words++] = ctx->meta_page ? ctx->meta_page->time_enabled : 0;
+			if (ctx->attr.read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
+				values[words++] = ctx->meta_page ? ctx->meta_page->time_running : 0;
+			if (ctx->attr.read_format & PERF_FORMAT_ID)
+				values[words++] = ctx->id;
+			if (ctx->attr.read_format & PERF_FORMAT_LOST)
+				values[words++] = 0;
+		}
+
+		bytes = words * sizeof(values[0]);
+		if (count < bytes)
+			return -EINVAL;
+		if (copy_to_user(buf, values, bytes))
+			return -EFAULT;
+
+		*ppos += bytes;
+		return bytes;
+	}
+
+	static __poll_t shanzi_fake_perf_poll(struct file *file, poll_table *wait)
+	{
+		struct shanzi_fake_perf_ctx *ctx = file->private_data;
+
+		shanzi_fake_perf_sync_time(ctx);
+		if (ctx && ctx->enabled && !ctx->paused)
+			return EPOLLIN | EPOLLRDNORM;
+		return 0;
+	}
+
+	static int shanzi_fake_perf_release(struct inode *inode, struct file *file)
+	{
+		struct shanzi_fake_perf_ctx *ctx = file->private_data;
+
+		if (ctx)
+			shanzi_fake_perf_set_enabled(ctx, false);
+		if (ctx && ctx->meta_page)
+			free_page((unsigned long)ctx->meta_page);
+		kfree(ctx);
+		file->private_data = NULL;
+		return 0;
+	}
+
+	static long shanzi_fake_perf_unlocked_ioctl(struct file *file,
+					    unsigned int cmd,
+					    unsigned long arg)
+	{
+		struct shanzi_fake_perf_ctx *ctx = file->private_data;
+		__u64 value;
+		struct perf_event_attr attr;
+
+		if (!ctx)
+			return -EINVAL;
+
+		shanzi_fake_perf_sync_time(ctx);
+		switch (cmd) {
+		case PERF_EVENT_IOC_ENABLE:
+			shanzi_fake_perf_set_paused(ctx, false);
+			shanzi_fake_perf_set_enabled(ctx, true);
+			return 0;
+		case PERF_EVENT_IOC_DISABLE:
+			shanzi_fake_perf_set_enabled(ctx, false);
+			return 0;
+		case PERF_EVENT_IOC_RESET:
+			ctx->count = 0;
+			ctx->total_enabled_ns = 0;
+			ctx->total_running_ns = 0;
+			ctx->time_zero_ns = ktime_get_ns();
+			if (ctx->enabled)
+				ctx->enable_start_ns = ctx->time_zero_ns;
+			if (ctx->enabled && !ctx->paused)
+				ctx->running_start_ns = ctx->time_zero_ns;
+			if (ctx->meta_page) {
+				ctx->meta_page->data_head = 0;
+				ctx->meta_page->data_tail = 0;
+			}
+			shanzi_fake_perf_sync_time(ctx);
+			return 0;
+		case PERF_EVENT_IOC_REFRESH:
+			return 0;
+		case PERF_EVENT_IOC_PERIOD:
+			if (copy_from_user(&value, (void __user *)arg, sizeof(value)))
+				return -EFAULT;
+			ctx->period = value;
+			return 0;
+		case PERF_EVENT_IOC_SET_OUTPUT:
+			return 0;
+		case PERF_EVENT_IOC_SET_FILTER:
+			ctx->filter_attached = true;
+			return 0;
+		case PERF_EVENT_IOC_ID:
+			value = ctx->id;
+			if (copy_to_user((void __user *)arg, &value, sizeof(value)))
+				return -EFAULT;
+			return 0;
+		case PERF_EVENT_IOC_SET_BPF:
+			ctx->bpf_attached = true;
+			return 0;
+		case PERF_EVENT_IOC_PAUSE_OUTPUT:
+			if (copy_from_user(&value, (void __user *)arg, sizeof(__u32)))
+				return -EFAULT;
+			shanzi_fake_perf_set_paused(ctx, !!(__u32)value);
+			return 0;
+		case PERF_EVENT_IOC_QUERY_BPF: {
+			struct perf_event_query_bpf query;
+
+			memset(&query, 0, sizeof(query));
+			if (copy_from_user(&query, (void __user *)arg, sizeof(query)))
+				return -EFAULT;
+			query.prog_cnt = 0;
+			if (copy_to_user((void __user *)arg, &query, sizeof(query)))
+				return -EFAULT;
+			return 0;
+		}
+		case PERF_EVENT_IOC_MODIFY_ATTRIBUTES:
+			if (!shanzi_read_perf_event_attr((struct perf_event_attr __user *)arg,
+						&attr))
+				return -EFAULT;
+			if (attr.type != PERF_TYPE_BREAKPOINT)
+				return -EINVAL;
+			ctx->attr = attr;
+			shanzi_fake_perf_set_enabled(ctx, !attr.disabled);
+			return 0;
+		default:
+			return -ENOTTY;
+		}
+	}
+
+	static const struct file_operations shanzi_fake_perf_fops = {
+		.owner = THIS_MODULE,
+		.read = shanzi_fake_perf_read,
+		.poll = shanzi_fake_perf_poll,
+		.release = shanzi_fake_perf_release,
+		.unlocked_ioctl = shanzi_fake_perf_unlocked_ioctl,
+		.mmap = shanzi_fake_perf_mmap,
+		.llseek = no_llseek,
+#ifdef CONFIG_COMPAT
+		.compat_ioctl = shanzi_fake_perf_unlocked_ioctl,
+#endif
+	};
+
+	static int shanzi_prepare_fake_perf_file(void)
+	{
+		return 0;
+	}
+
+	static void shanzi_cleanup_fake_perf_file(void)
+	{
+	}
+
+	static long shanzi_install_fake_perf_fd(const struct perf_event_attr *attr,
+					 pid_t pid, int cpu, int group_fd,
+					 unsigned long flags)
+	{
+		struct shanzi_fake_perf_ctx *ctx;
+		struct file *file;
+		int fd;
+
+		if (!attr)
+			return -EINVAL;
+
+		ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+		if (!ctx)
+			return -ENOMEM;
+
+		ctx->attr = *attr;
+		ctx->id = (u64)atomic64_inc_return(&shanzi_fake_perf_next_id);
+		ctx->period = attr->sample_period;
+		ctx->pid = pid;
+		ctx->cpu = cpu;
+		ctx->group_fd = group_fd;
+		ctx->flags = flags;
+		ctx->enabled = !attr->disabled;
+		ctx->paused = false;
+		ctx->time_zero_ns = ktime_get_ns();
+		if (ctx->enabled) {
+			ctx->enable_start_ns = ctx->time_zero_ns;
+			ctx->running_start_ns = ctx->time_zero_ns;
+		}
+		ctx->meta_page = (struct perf_event_mmap_page *)get_zeroed_page(
+			GFP_KERNEL | __GFP_ZERO);
+		if (!ctx->meta_page) {
+			kfree(ctx);
+			return -ENOMEM;
+		}
+
+		ctx->meta_page->version = 0;
+		ctx->meta_page->compat_version = 0;
+		ctx->meta_page->cap_user_time = 1;
+		ctx->meta_page->time_mult = 1;
+		ctx->meta_page->time_shift = 0;
+		ctx->meta_page->time_zero = ctx->time_zero_ns;
+		ctx->meta_page->size = PAGE_SIZE;
+		ctx->meta_page->data_offset = PAGE_SIZE;
+		ctx->meta_page->data_size = 0;
+		ctx->meta_page->aux_offset = PAGE_SIZE;
+		ctx->meta_page->aux_size = 0;
+		ctx->meta_page->time_enabled = 0;
+		ctx->meta_page->time_running = 0;
+		shanzi_fake_perf_sync_time(ctx);
+
+		fd = get_unused_fd_flags(O_CLOEXEC);
+		if (fd < 0) {
+			free_page((unsigned long)ctx->meta_page);
+			kfree(ctx);
+			return fd;
+		}
+
+		file = anon_inode_getfile("shanzi_perf", &shanzi_fake_perf_fops, ctx,
+					  O_RDWR);
+		if (IS_ERR(file)) {
+			put_unused_fd(fd);
+			free_page((unsigned long)ctx->meta_page);
+			kfree(ctx);
+			return PTR_ERR(file);
+		}
+
+		fd_install(fd, file);
+		return fd;
+	}
+
 	static int shanzi_install_fd_to_current(int __user *out_fd)
 	{
 		struct file *file;
@@ -3948,6 +4548,9 @@ out_free:
 		if (shanzi_install_ptrace_virtualization())
 			SHZ_INFO(
 				"Shanzi: ptrace virtualization unavailable, continuing without it\n");
+		if (shanzi_install_perf_event_virtualization())
+			SHZ_INFO(
+				"Shanzi: perf_event_open virtualization unavailable, continuing without it\n");
 		SHZ_INFO("Shanzi: loaded, device /dev/%s ready\n",
 			 HELLO_DEVICE_NAME);
 
@@ -3973,6 +4576,7 @@ out_free:
 			mutex_unlock(&shanzi_module_hide_lock);
 		}
 
+		shanzi_remove_perf_event_virtualization();
 		shanzi_remove_ptrace_virtualization();
 		device_destroy(hello_class, MKDEV(hello_major, 0));
 		class_destroy(hello_class);
