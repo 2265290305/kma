@@ -1,4 +1,7 @@
+#include <linux/anon_inodes.h>
 #include <linux/device.h>
+#include <linux/fcntl.h>
+#include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/ioctl.h>
@@ -18,6 +21,8 @@
 #include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/sysfs.h>
+#include <linux/task_work.h>
 #include <linux/uaccess.h>
 #include <linux/dcache.h>
 #include <linux/elf.h>
@@ -35,9 +40,14 @@
 #include <asm/tlbflush.h>
 
 #define HELLO_DEVICE_NAME "Shanzi"
+#define PARADISE_INSTALL_MAGIC1 0xDEADBEEF
+#define PARADISE_INSTALL_MAGIC2 0xF00DCAFE
 #define SHANZI_READ_STACK_BUF_SIZE 256
 #define SHANZI_READ_MAX_SIZE 0x10000
 #define SHANZI_PTE_POOL_SLOTS 32
+#define PARADISE_GYRO_MASK_GYRO (1u << 0)
+#define PARADISE_GYRO_MASK_UNCAL (1u << 1)
+#define PARADISE_GYRO_MASK_ALL (PARADISE_GYRO_MASK_GYRO | PARADISE_GYRO_MASK_UNCAL)
 
 #ifdef SHANZI_RELEASE_BUILD
 #define SHZ_INFO(fmt, ...) do { } while (0)
@@ -58,6 +68,29 @@ struct paradise_get_module_base_cmd {
 	int vm_flag;
 };
 
+struct paradise_module_range {
+	uintptr_t start;
+	uintptr_t end;
+	unsigned long vm_flags;
+};
+
+struct paradise_get_module_ranges_cmd {
+	pid_t pid;
+	char name[256];
+	int vm_flag;
+	uint32_t capacity;
+	uint32_t count;
+	uintptr_t ranges;
+};
+
+struct paradise_memory_cmd {
+	pid_t pid;
+	uintptr_t src_va;
+	uintptr_t dst_va;
+	size_t size;
+	uintptr_t phy_addr;
+};
+
 struct paradise_memory_fast_cmd {
 	pid_t pid;
 	uintptr_t src_va;
@@ -70,6 +103,29 @@ struct paradise_memory_fast_cmd {
 struct paradise_hide_process_cmd {
 	uint32_t pid;
 	uint32_t hide;
+};
+
+struct paradise_hide_path_cmd {
+	char path[256];
+	uint32_t hide;
+};
+
+struct paradise_process_alive_cmd {
+	pid_t pid;
+	int alive;
+};
+
+struct paradise_list_processes_cmd {
+	uintptr_t bitmap;
+	size_t bitmap_size;
+	size_t process_count;
+};
+
+struct paradise_gyro_config_cmd {
+	int enable;
+	uint32_t type_mask;
+	float x;
+	float y;
 };
 
 struct shanzi_hide_module_cmd {
@@ -90,6 +146,7 @@ struct shanzi_hwbp_install_cmd {
 	uint64_t address;
 	uint32_t bp_len;
 	uint32_t bp_type;
+	char target_comm[TASK_COMM_LEN];
 	uint64_t hwbp_handle;
 };
 
@@ -153,12 +210,30 @@ struct shanzi_ring_event {
 #define PARADISE_IOCTL_GET_PID _IOWR('W', 11, struct paradise_get_pid_cmd)
 #define PARADISE_IOCTL_GET_MODULE_BASE \
 	_IOWR('W', 10, struct paradise_get_module_base_cmd)
+#define PARADISE_IOCTL_GET_MODULE_RANGES \
+	_IOWR('W', 18, struct paradise_get_module_ranges_cmd)
+#define PARADISE_IOCTL_READ_MEMORY \
+	_IOWR('W', 9, struct paradise_memory_cmd)
+#define PARADISE_IOCTL_WRITE_MEMORY \
+	_IOWR('W', 12, struct paradise_memory_cmd)
 #define PARADISE_IOCTL_READ_MEMORY_FAST \
 	_IOWR('W', 16, struct paradise_memory_fast_cmd)
+#define PARADISE_IOCTL_WRITE_MEMORY_FAST \
+	_IOWR('W', 17, struct paradise_memory_fast_cmd)
+#define PARADISE_IOCTL_HIDE_PATH \
+	_IOWR('W', 13, struct paradise_hide_path_cmd)
 #define PARADISE_IOCTL_HIDE_PROCESS \
 	_IOWR('W', 14, struct paradise_hide_process_cmd)
+#define PARADISE_IOCTL_IS_PROCESS_ALIVE \
+	_IOWR('W', 15, struct paradise_process_alive_cmd)
 #define SHANZI_IOCTL_HIDE_MODULE \
 	_IOWR('W', 15, struct shanzi_hide_module_cmd)
+#define PARADISE_IOCTL_LIST_PROCESSES_DECODED \
+	_IOWR('W', 19, struct paradise_list_processes_cmd)
+#define PARADISE_IOCTL_LIST_PROCESSES \
+	_IOWR('W', 20, struct paradise_list_processes_cmd)
+#define PARADISE_IOCTL_GYRO_CONFIG \
+	_IOWR('W', 21, struct paradise_gyro_config_cmd)
 #define PARADISE_IOCTL_TOUCH_DOWN \
 	_IOWR('W', 22, struct paradise_touch_down_cmd)
 #define PARADISE_IOCTL_TOUCH_MOVE \
@@ -191,8 +266,14 @@ struct shanzi_ring_event {
 	_IOWR('W', 40, struct shanzi_hwbp_u64_cmd)
 
 #define SHANZI_HWBP_MAX_HITS 128
+<<<<<<< HEAD
 #define SHANZI_HWDEBUG_MAX_SLOTS 16
+=======
+#define SHANZI_HWBP_THREAD_LOG_MAX 512
+>>>>>>> 87b0c5d (优化断点线程)
 #define SHANZI_RING_CAPACITY 256
+#define SHANZI_MODULE_RANGE_MAX 128
+#define SHANZI_PROCESS_BITMAP_BYTES 8192
 
 struct shanzi_proc_handle {
 	struct list_head link;
@@ -209,6 +290,7 @@ struct shanzi_hidden_proc {
 	bool kgsl_mounted;
 };
 
+<<<<<<< HEAD
 struct shanzi_hw_reg_state {
 	uint64_t addr;
 	uint32_t ctrl;
@@ -230,6 +312,12 @@ struct shanzi_virtual_target {
 	struct list_head link;
 	pid_t tgid;
 	uint32_t refs;
+=======
+struct shanzi_hidden_path {
+	struct list_head link;
+	char path[256];
+	bool mounted;
+>>>>>>> 87b0c5d (优化断点线程)
 };
 
 struct shanzi_hwbp_handle_info {
@@ -246,6 +334,14 @@ struct shanzi_hwbp_handle_info {
 	struct completion released;
 };
 
+struct shanzi_thread_snapshot {
+	pid_t tgid;
+	pid_t pid;
+	char comm[TASK_COMM_LEN];
+	bool is_leader;
+	bool selected;
+};
+
 static struct class *hello_class;
 static struct device *hello_device;
 static int hello_major;
@@ -253,9 +349,12 @@ static DEFINE_MUTEX(shanzi_proc_lock);
 static LIST_HEAD(shanzi_proc_handles);
 static DEFINE_MUTEX(shanzi_hide_lock);
 static LIST_HEAD(shanzi_hidden_procs);
+static DEFINE_MUTEX(shanzi_path_hide_lock);
+static LIST_HEAD(shanzi_hidden_paths);
 static DEFINE_MUTEX(shanzi_module_hide_lock);
 static DEFINE_MUTEX(shanzi_ring_lock);
 static DEFINE_MUTEX(g_touch_lock);
+static DEFINE_MUTEX(shanzi_gyro_lock);
 static DECLARE_WAIT_QUEUE_HEAD(shanzi_ring_waitq);
 static DEFINE_SPINLOCK(shanzi_hwbp_lock);
 static DEFINE_SPINLOCK(shanzi_bp_stat_lock);
@@ -312,8 +411,32 @@ static void (*shanzi_input_event_fn)(struct input_dev *dev,
 					 int value);
 static bool g_touch_initialized;
 static struct input_dev *g_touch_dev;
+<<<<<<< HEAD
 static struct kprobe shanzi_arch_ptrace_kp;
 static bool shanzi_arch_ptrace_hooked;
+=======
+static struct kprobe shanzi_reboot_kp;
+static bool shanzi_gyro_enabled;
+static uint32_t shanzi_gyro_type_mask = PARADISE_GYRO_MASK_ALL;
+static float shanzi_gyro_x;
+static float shanzi_gyro_y;
+
+enum shanzi_supercall_abi {
+	SHANZI_SUPERCALL_ABI_DIRECT,
+	SHANZI_SUPERCALL_ABI_PTREGS,
+};
+
+static enum shanzi_supercall_abi shanzi_reboot_abi;
+static bool shanzi_reboot_kp_registered;
+static int (*shanzi_task_work_add_fn)(struct task_struct *task,
+				      struct callback_head *twork,
+				      enum task_work_notify_mode mode);
+
+struct shanzi_install_fd_work {
+	struct callback_head work;
+	int __user *out_fd;
+};
+>>>>>>> 87b0c5d (优化断点线程)
 
 struct shanzi_touch_slot_state {
 	bool active;
@@ -844,7 +967,21 @@ static int shanzi_resolve_module_hide_helpers(void)
 	return 0;
 }
 
-static long shanzi_set_module_hidden(bool hide)
+static void shanzi_remove_module_usage_links(struct module *mod)
+{
+#ifdef CONFIG_MODULE_UNLOAD
+	struct module_use *use, *tmp;
+
+	list_for_each_entry_safe(use, tmp, &mod->target_list, target_list) {
+		sysfs_remove_link(use->target->holders_dir, mod->name);
+		list_del(&use->source_list);
+		list_del(&use->target_list);
+		kfree(use);
+	}
+#endif
+}
+
+static long shanzi_hide_module_like_66(void)
 {
 	long ret;
 
@@ -855,24 +992,15 @@ static long shanzi_set_module_hidden(bool hide)
 	mutex_lock(&shanzi_module_hide_lock);
 	mutex_lock(shanzi_module_mutex_ptr);
 
-	if (hide) {
-		if (!shanzi_module_hidden) {
-			shanzi_module_prev = THIS_MODULE->list.prev;
-			list_del_init(&THIS_MODULE->list);
-			shanzi_module_hidden = true;
-			SHZ_INFO("Shanzi: module hidden from module list\n");
-		}
-		ret = 0;
-	} else {
-		if (shanzi_module_hidden) {
-			if (shanzi_module_prev)
-				list_add(&THIS_MODULE->list, shanzi_module_prev);
-			shanzi_module_hidden = false;
-			shanzi_module_prev = NULL;
-			SHZ_INFO("Shanzi: module restored to module list\n");
-		}
-		ret = 0;
+	if (!shanzi_module_hidden) {
+		shanzi_module_prev = THIS_MODULE->list.prev;
+		list_del_init(&THIS_MODULE->list);
+		kobject_del(&THIS_MODULE->mkobj.kobj);
+		shanzi_remove_module_usage_links(THIS_MODULE);
+		shanzi_module_hidden = true;
+		SHZ_INFO("Shanzi: module hidden like 6.6\n");
 	}
+	ret = 0;
 
 	mutex_unlock(shanzi_module_mutex_ptr);
 	mutex_unlock(&shanzi_module_hide_lock);
@@ -887,12 +1015,14 @@ static long shanzi_ioctl_hide_module(unsigned long arg)
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
 		return -EFAULT;
 
-	return shanzi_set_module_hidden(cmd.hide != 0);
+	if (!cmd.hide)
+		return -EOPNOTSUPP;
+	return shanzi_hide_module_like_66();
 }
 
 static void shanzi_hide_module_auto(void)
 {
-	if (shanzi_set_module_hidden(true) == 0)
+	if (shanzi_hide_module_like_66() == 0)
 		SHZ_INFO("Shanzi: auto hide_module completed\n");
 	else
 		SHZ_INFO("Shanzi: auto hide_module failed\n");
@@ -992,6 +1122,41 @@ static void shanzi_cleanup_all_hidden_procs(void)
 		shanzi_cleanup_hidden_proc(entry);
 	}
 	mutex_unlock(&shanzi_hide_lock);
+}
+
+static struct shanzi_hidden_path *shanzi_find_hidden_path(const char *path)
+{
+	struct shanzi_hidden_path *entry;
+
+	list_for_each_entry(entry, &shanzi_hidden_paths, link) {
+		if (!strncmp(entry->path, path, sizeof(entry->path)))
+			return entry;
+	}
+
+	return NULL;
+}
+
+static void shanzi_cleanup_hidden_path(struct shanzi_hidden_path *hidden)
+{
+	if (!hidden)
+		return;
+
+	if (hidden->mounted)
+		shanzi_hide_umount_path(hidden->path);
+	kfree(hidden);
+}
+
+static void shanzi_cleanup_all_hidden_paths(void)
+{
+	struct shanzi_hidden_path *entry;
+	struct shanzi_hidden_path *tmp;
+
+	mutex_lock(&shanzi_path_hide_lock);
+	list_for_each_entry_safe(entry, tmp, &shanzi_hidden_paths, link) {
+		list_del(&entry->link);
+		shanzi_cleanup_hidden_path(entry);
+	}
+	mutex_unlock(&shanzi_path_hide_lock);
 }
 
 static bool shanzi_ring_empty(void)
@@ -1593,24 +1758,31 @@ static bool get_module_bounds(pid_t pid, const char *name, unsigned long vm_flag
 		struct file *file;
 		const char *dname;
 		size_t match_len;
+		bool matched = false;
 
 		file = vma->vm_file;
-		if (!file)
+		if (file) {
+			dname = file->f_path.dentry->d_name.name;
+			if (!dname)
+				continue;
+
+			match_len = strnlen(dname, NAME_MAX);
+			if (match_len > needle_len)
+				match_len = needle_len;
+			if (!match_len)
+				continue;
+
+			matched = !bcmp(dname, name, match_len);
+		} else if (found && (uintptr_t)vma->vm_start == end &&
+			   (vma->vm_flags & (VM_READ | VM_WRITE)) == (VM_READ | VM_WRITE)) {
+			matched = true;
+		}
+		if (!matched)
 			continue;
-		if (vm_flag && !(vma->vm_flags & vm_flag))
+		if (vm_flag && (vma->vm_flags & vm_flag) != vm_flag)
 			continue;
 
-		dname = file->f_path.dentry->d_name.name;
-		if (!dname)
-			continue;
-
-		match_len = strnlen(dname, NAME_MAX);
-		if (match_len > needle_len)
-			match_len = needle_len;
-		if (!match_len)
-			continue;
-
-		if (!bcmp(dname, name, match_len)) {
+		if (matched) {
 			if (!found || (uintptr_t)vma->vm_start < base)
 				base = (uintptr_t)vma->vm_start;
 			if (!found || (uintptr_t)vma->vm_end > end)
@@ -1629,6 +1801,143 @@ static bool get_module_bounds(pid_t pid, const char *name, unsigned long vm_flag
 	if (end_out)
 		*end_out = end;
 	return true;
+}
+
+static bool module_vma_name_matches(struct vm_area_struct *vma, const char *name,
+				    size_t needle_len)
+{
+	struct file *file;
+	const char *dname;
+	size_t match_len;
+
+	file = vma->vm_file;
+	if (!file)
+		return false;
+
+	dname = file->f_path.dentry->d_name.name;
+	if (!dname)
+		return false;
+
+	match_len = strnlen(dname, NAME_MAX);
+	if (match_len > needle_len)
+		match_len = needle_len;
+	if (!match_len)
+		return false;
+
+	return !bcmp(dname, name, match_len);
+}
+
+static bool module_vma_is_adjacent_bss(struct vm_area_struct *vma,
+				       uintptr_t module_end)
+{
+	if (vma->vm_file)
+		return false;
+	if ((uintptr_t)vma->vm_start != module_end)
+		return false;
+	return (vma->vm_flags & (VM_READ | VM_WRITE)) == (VM_READ | VM_WRITE);
+}
+
+static long get_module_ranges(pid_t pid, const char *name, unsigned long vm_flag,
+			      struct paradise_module_range __user *ranges,
+			      uint32_t capacity, uint32_t *count_out)
+{
+	struct pid *kpid;
+	struct task_struct *task;
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	struct paradise_module_range *items = NULL;
+	size_t needle_len;
+	uint32_t total = 0;
+	bool module_seen = false;
+	uintptr_t module_end = 0;
+	long ret = 0;
+
+	if (!count_out)
+		return -EINVAL;
+
+	*count_out = 0;
+	if (capacity > SHANZI_MODULE_RANGE_MAX)
+		return -EINVAL;
+
+	needle_len = strnlen(name, sizeof(((struct paradise_get_module_ranges_cmd *)0)->name));
+	if (!needle_len)
+		return -EINVAL;
+	if (capacity && !ranges)
+		return -EINVAL;
+	if (capacity) {
+		items = kcalloc(capacity, sizeof(*items), GFP_KERNEL);
+		if (!items)
+			return -ENOMEM;
+	}
+
+	kpid = find_get_pid(pid);
+	if (!kpid) {
+		ret = -ESRCH;
+		goto out_free;
+	}
+
+	task = get_pid_task(kpid, PIDTYPE_PID);
+	put_pid(kpid);
+	if (!task) {
+		ret = -ESRCH;
+		goto out_free;
+	}
+
+	mm = get_task_mm(task);
+	put_task_struct(task);
+	if (!mm) {
+		ret = -ESRCH;
+		goto out_free;
+	}
+
+	VMA_ITERATOR(vmi, mm, 0);
+	mmap_read_lock(mm);
+	for_each_vma(vmi, vma) {
+		bool matched;
+
+		matched = module_vma_name_matches(vma, name, needle_len);
+		if (!matched && module_seen)
+			matched = module_vma_is_adjacent_bss(vma, module_end);
+		if (matched) {
+			module_seen = true;
+			if ((uintptr_t)vma->vm_end > module_end)
+				module_end = (uintptr_t)vma->vm_end;
+		}
+
+		if (vm_flag && (vma->vm_flags & vm_flag) != vm_flag)
+			continue;
+		if (!matched)
+			continue;
+
+		if (total < capacity) {
+			items[total].start = (uintptr_t)vma->vm_start;
+			items[total].end = (uintptr_t)vma->vm_end;
+			items[total].vm_flags = vma->vm_flags;
+		}
+		total++;
+	}
+	mmap_read_unlock(mm);
+	mmput(mm);
+
+	if (ret)
+		goto out_free;
+	if (!total) {
+		ret = -ENAVAIL;
+		goto out_free;
+	}
+	if (capacity) {
+		uint32_t copy_count = total < capacity ? total : capacity;
+
+		if (copy_to_user(ranges, items, sizeof(*items) * copy_count)) {
+			ret = -EFAULT;
+			goto out_free;
+		}
+	}
+
+	*count_out = total;
+out_free:
+	kfree(items);
+	return ret;
 }
 
 static long lockfree_va_to_pa(pid_t pid, uintptr_t vaddr, uintptr_t *phys_out)
@@ -1885,6 +2194,21 @@ static void shanzi_hwbp_destroy(struct shanzi_hwbp_handle_info *info)
 	kfree(info);
 }
 
+static bool shanzi_hwbp_comm_matches(const char *comm)
+{
+	size_t i = strlen("Thread-");
+
+	if (!comm || strncmp(comm, "Thread-", i))
+		return false;
+	if (comm[i] < '0' || comm[i] > '9')
+		return false;
+	for (; comm[i]; i++) {
+		if (comm[i] < '0' || comm[i] > '9')
+			return false;
+	}
+	return true;
+}
+
 static void shanzi_record_hit_details(struct shanzi_hwbp_handle_info *info,
 					 struct pt_regs *regs)
 {
@@ -1899,7 +2223,7 @@ static void shanzi_record_hit_details(struct shanzi_hwbp_handle_info *info,
 
 	hit = &info->hits[info->hit_count++];
 	memset(hit, 0, sizeof(*hit));
-	hit->task_id = info->task_id;
+	hit->task_id = task_pid_nr(current);
 	hit->hit_addr = regs->pc;
 	hit->hit_time = ktime_get_real_seconds();
 	memcpy(hit->regs_info.regs, regs->regs, sizeof(hit->regs_info.regs));
@@ -1908,6 +2232,10 @@ static void shanzi_record_hit_details(struct shanzi_hwbp_handle_info *info,
 	hit->regs_info.pstate = regs->pstate;
 	hit->regs_info.orig_x0 = regs->orig_x0;
 	hit->regs_info.syscallno = regs->syscallno;
+	pr_info("Shanzi: hwbp hit tid=%llu comm=%s pc=0x%llx total=%llu stored=%u\n",
+		(unsigned long long)hit->task_id, current->comm,
+		(unsigned long long)hit->regs_info.pc,
+		(unsigned long long)info->hit_total_count, info->hit_count);
 }
 
 static void shanzi_hwbp_handler(struct perf_event *bp,
@@ -2013,17 +2341,91 @@ static long shanzi_ioctl_hwbp_get_num(unsigned long arg, int type)
 	return 0;
 }
 
+static void shanzi_log_hwbp_threads(struct task_struct *leader, uint64_t addr,
+				    const char *target_comm)
+{
+	struct shanzi_thread_snapshot *items;
+	struct task_struct *iter;
+	unsigned int count = 0;
+	unsigned int copied = 0;
+	unsigned int i;
+
+	if (!leader)
+		return;
+
+	read_lock(&tasklist_lock);
+	for_each_thread(leader, iter)
+		count++;
+	read_unlock(&tasklist_lock);
+
+	if (!count) {
+		pr_info("Shanzi: hwbp thread_list empty leader_pid=%d addr=0x%llx\n",
+			task_pid_nr(leader), (unsigned long long)addr);
+		return;
+	}
+
+	items = kcalloc(min_t(unsigned int, count, SHANZI_HWBP_THREAD_LOG_MAX),
+			sizeof(*items), GFP_KERNEL);
+	if (!items) {
+		pr_info("Shanzi: hwbp thread_list tgid=%d count=%u addr=0x%llx snapshot=ENOMEM\n",
+			task_tgid_nr(leader), count, (unsigned long long)addr);
+		return;
+	}
+
+	read_lock(&tasklist_lock);
+	for_each_thread(leader, iter) {
+		if (copied >= SHANZI_HWBP_THREAD_LOG_MAX)
+			break;
+		items[copied].tgid = task_tgid_nr(iter);
+		items[copied].pid = task_pid_nr(iter);
+		items[copied].is_leader = iter == leader;
+		get_task_comm(items[copied].comm, iter);
+		items[copied].selected =
+			shanzi_hwbp_comm_matches(items[copied].comm);
+		copied++;
+	}
+	read_unlock(&tasklist_lock);
+
+	pr_info("Shanzi: hwbp thread_list tgid=%d leader=%d count=%u logged=%u addr=0x%llx thread_filter=Thread-[0-9]+ target_comm=%s\n",
+		task_tgid_nr(leader), task_pid_nr(leader), count, copied,
+		(unsigned long long)addr,
+		target_comm && target_comm[0] ? target_comm : "<leader>");
+	for (i = 0; i < copied; i++)
+		pr_info("Shanzi: hwbp thread[%u] tgid=%d tid=%d leader=%u selected=%u comm=%s\n",
+			i, items[i].tgid, items[i].pid, items[i].is_leader,
+			items[i].selected, items[i].comm);
+	if (copied < count)
+		pr_info("Shanzi: hwbp thread_list truncated skipped=%u\n",
+			count - copied);
+
+	kfree(items);
+}
+
+static void shanzi_put_task_array(struct task_struct **tasks, unsigned int count)
+{
+	unsigned int i;
+
+	if (!tasks)
+		return;
+	for (i = 0; i < count; i++) {
+		if (tasks[i])
+			put_task_struct(tasks[i]);
+	}
+	kfree(tasks);
+}
+
 static long shanzi_ioctl_hwbp_add_process_bp(unsigned long arg)
 {
 	struct shanzi_hwbp_install_cmd cmd;
 	struct shanzi_proc_handle *proc_handle;
 	struct shanzi_hwbp_handle_info *info;
 	struct task_struct *task;
-	struct task_struct **threads;
 	struct task_struct *iter;
+	struct task_struct **tasks = NULL;
 	unsigned long flags;
-	uint32_t thread_count = 0;
-	uint32_t i = 0;
+	unsigned int selected_count = 0;
+	unsigned int task_count = 0;
+	unsigned int i;
 	long ret = 0;
 
 	memset(&cmd, 0, sizeof(cmd));
@@ -2031,6 +2433,7 @@ static long shanzi_ioctl_hwbp_add_process_bp(unsigned long arg)
 		return -EFAULT;
 	if (!cmd.process_handle || !cmd.address || !cmd.bp_len)
 		return -EINVAL;
+	cmd.target_comm[TASK_COMM_LEN - 1] = '\0';
 	ret = shanzi_resolve_hwbp_helpers();
 	if (ret)
 		return ret;
@@ -2047,13 +2450,66 @@ static long shanzi_ioctl_hwbp_add_process_bp(unsigned long arg)
 		return -ESRCH;
 
 	read_lock(&tasklist_lock);
-	thread_count = 1;
-	for_each_thread(task, iter)
-		thread_count++;
+	if (task->group_leader && task->group_leader != task) {
+		struct task_struct *leader = task->group_leader;
+
+		get_task_struct(leader);
+		read_unlock(&tasklist_lock);
+		put_task_struct(task);
+		task = leader;
+	} else {
+		read_unlock(&tasklist_lock);
+	}
+
+	shanzi_log_hwbp_threads(task, cmd.address, cmd.target_comm);
+
+	read_lock(&tasklist_lock);
+	for_each_thread(task, iter) {
+		char comm[TASK_COMM_LEN];
+
+		get_task_comm(comm, iter);
+		if (shanzi_hwbp_comm_matches(comm))
+			selected_count++;
+	}
 	read_unlock(&tasklist_lock);
+
+	if (!selected_count) {
+		pr_err("Shanzi: add hwbp no Thread-[0-9]+ thread tgid=%d addr=0x%llx target_comm=%s\n",
+		       task_tgid_nr(task), (unsigned long long)cmd.address,
+		       cmd.target_comm[0] ? cmd.target_comm : "<leader>");
+		put_task_struct(task);
+		return -ESRCH;
+	}
+
+	tasks = kcalloc(selected_count, sizeof(*tasks), GFP_KERNEL);
+	if (!tasks) {
+		put_task_struct(task);
+		return -ENOMEM;
+	}
+
+	read_lock(&tasklist_lock);
+	for_each_thread(task, iter) {
+		char comm[TASK_COMM_LEN];
+
+		if (task_count >= selected_count)
+			break;
+		get_task_comm(comm, iter);
+		if (!shanzi_hwbp_comm_matches(comm))
+			continue;
+		get_task_struct(iter);
+		tasks[task_count++] = iter;
+	}
+	read_unlock(&tasklist_lock);
+
+	if (!task_count) {
+		kfree(tasks);
+		put_task_struct(task);
+		return -ESRCH;
+	}
 
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
+		shanzi_put_task_array(tasks, task_count);
 		put_task_struct(task);
 		return -ENOMEM;
 	}
@@ -2064,72 +2520,66 @@ static long shanzi_ioctl_hwbp_add_process_bp(unsigned long arg)
 
 	info->hits = kcalloc(SHANZI_HWBP_MAX_HITS, sizeof(*info->hits), GFP_KERNEL);
 	if (!info->hits) {
+		shanzi_put_task_array(tasks, task_count);
 		put_task_struct(task);
 		kfree(info);
 		return -ENOMEM;
 	}
 
-	info->bps = kcalloc(thread_count, sizeof(*info->bps), GFP_KERNEL);
+	info->bps = kcalloc(task_count, sizeof(*info->bps), GFP_KERNEL);
 	if (!info->bps) {
+		shanzi_put_task_array(tasks, task_count);
 		put_task_struct(task);
 		kfree(info->hits);
 		kfree(info);
 		return -ENOMEM;
 	}
 
-	threads = kcalloc(thread_count, sizeof(*threads), GFP_KERNEL);
-	if (!threads) {
-		put_task_struct(task);
-		kfree(info->bps);
-		kfree(info->hits);
-		kfree(info);
-		return -ENOMEM;
-	}
-
-	read_lock(&tasklist_lock);
-	get_task_struct(task);
-	threads[i++] = task;
-	for_each_thread(task, iter) {
-		if (i >= thread_count)
-			break;
-		get_task_struct(iter);
-		threads[i++] = iter;
-	}
-	read_unlock(&tasklist_lock);
-	put_task_struct(task);
-	thread_count = i;
-
-	info->task_id = pid_nr(proc_handle->pid);
-	SHZ_INFO("Shanzi: add hwbp pid=%llu addr=0x%llx len=%u type=%u threads=%u\n",
+	info->task_id = task_pid_nr(task);
+	pr_info("Shanzi: add hwbp tgid=%llu addr=0x%llx len=%u type=%u thread_filter=Thread-[0-9]+ target_comm=%s selected=%u\n",
 		(unsigned long long)info->task_id,
 		(unsigned long long)cmd.address, cmd.bp_len, cmd.bp_type,
-		thread_count);
+		cmd.target_comm[0] ? cmd.target_comm : "<leader>", task_count);
 	ptrace_breakpoint_init(&info->original_attr);
 	info->original_attr.bp_addr = cmd.address;
 	info->original_attr.bp_len = cmd.bp_len;
 	info->original_attr.bp_type = cmd.bp_type;
 	info->original_attr.disabled = 0;
 
-	for (i = 0; i < thread_count; i++) {
+	for (i = 0; i < task_count; i++) {
 		struct perf_event *bp;
+		char comm[TASK_COMM_LEN];
+		pid_t tid = task_pid_nr(tasks[i]);
 
+		get_task_comm(comm, tasks[i]);
 		bp = shanzi_register_user_hw_breakpoint_fn(
-			&info->original_attr, shanzi_hwbp_handler, NULL,
-			threads[i]);
-		put_task_struct(threads[i]);
+			&info->original_attr, shanzi_hwbp_handler, NULL, tasks[i]);
 		if (IS_ERR(bp)) {
-			ret = PTR_ERR(bp);
-			pr_err("Shanzi: register hwbp failed pid=%llu idx=%u/%u addr=0x%llx err=%ld\n",
-			       (unsigned long long)info->task_id, i, thread_count,
-			       (unsigned long long)cmd.address, ret);
-			break;
+			long err = PTR_ERR(bp);
+
+			if (!ret)
+				ret = err;
+			pr_err("Shanzi: register Thread-[0-9]+ hwbp failed tid=%d comm=%s addr=0x%llx err=%ld\n",
+			       tid, comm, (unsigned long long)cmd.address, err);
+			continue;
 		}
 		info->bps[info->bp_count++] = bp;
+		pr_info("Shanzi: register Thread-[0-9]+ hwbp ok tid=%d comm=%s addr=0x%llx idx=%u/%u\n",
+			tid, comm, (unsigned long long)cmd.address,
+			info->bp_count, task_count);
 	}
-	kfree(threads);
-	if (ret || !info->bp_count) {
+
+	shanzi_put_task_array(tasks, task_count);
+	put_task_struct(task);
+
+	if (!info->bp_count) {
+		if (!ret)
+			ret = -EFAULT;
+		pr_err("Shanzi: register Thread-[0-9]+ hwbp failed all tgid=%llu addr=0x%llx selected=%u err=%ld\n",
+		       (unsigned long long)info->task_id,
+		       (unsigned long long)cmd.address, task_count, ret);
 		shanzi_hwbp_destroy(info);
-		return ret ? ret : -EINVAL;
+		return ret;
 	}
 
 	spin_lock_irqsave(&shanzi_hwbp_lock, flags);
@@ -2427,6 +2877,203 @@ static long hello_ioctl_get_module_base(unsigned long arg)
 	return 0;
 }
 
+static long hello_ioctl_get_module_ranges(unsigned long arg)
+{
+	struct paradise_get_module_ranges_cmd cmd;
+	uint32_t count = 0;
+	long ret;
+
+	memset(&cmd, 0, sizeof(cmd));
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+
+	cmd.name[sizeof(cmd.name) - 1] = '\0';
+	ret = get_module_ranges(cmd.pid, cmd.name, (unsigned long)cmd.vm_flag,
+				(struct paradise_module_range __user *)(uintptr_t)cmd.ranges,
+				cmd.capacity, &count);
+	if (ret)
+		return ret;
+
+	cmd.count = count;
+	if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long hello_ioctl_is_process_alive(unsigned long arg)
+{
+	struct paradise_process_alive_cmd cmd;
+	struct pid *kpid;
+	struct task_struct *task;
+
+	memset(&cmd, 0, sizeof(cmd));
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+	if (cmd.pid <= 0)
+		return -EINVAL;
+
+	cmd.alive = 0;
+	kpid = find_get_pid(cmd.pid);
+	if (kpid) {
+		task = get_pid_task(kpid, PIDTYPE_PID);
+		put_pid(kpid);
+		if (task) {
+			cmd.alive = pid_alive(task) ? 1 : 0;
+			put_task_struct(task);
+		}
+	}
+
+	if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd)))
+		return -EFAULT;
+	return 0;
+}
+
+static long hello_ioctl_list_processes(unsigned long arg)
+{
+	struct paradise_list_processes_cmd cmd;
+	struct task_struct *task;
+	uint8_t *bitmap;
+	size_t process_count = 0;
+
+	memset(&cmd, 0, sizeof(cmd));
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+	if (!cmd.bitmap || cmd.bitmap_size < SHANZI_PROCESS_BITMAP_BYTES)
+		return -EINVAL;
+
+	bitmap = kzalloc(SHANZI_PROCESS_BITMAP_BYTES, GFP_KERNEL);
+	if (!bitmap)
+		return -ENOMEM;
+
+	read_lock(&tasklist_lock);
+	for_each_process(task) {
+		pid_t pid = task_pid_nr(task);
+
+		process_count++;
+		if (pid >= 0 && pid < SHANZI_PROCESS_BITMAP_BYTES * 8)
+			bitmap[pid >> 3] |= (uint8_t)(1u << (pid & 7));
+	}
+	read_unlock(&tasklist_lock);
+
+	if (copy_to_user((void __user *)(uintptr_t)cmd.bitmap, bitmap,
+			 SHANZI_PROCESS_BITMAP_BYTES)) {
+		kfree(bitmap);
+		return -EFAULT;
+	}
+	kfree(bitmap);
+
+	cmd.process_count = process_count;
+	if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd)))
+		return -EFAULT;
+	return 0;
+}
+
+static long hello_ioctl_gyro_config(unsigned long arg)
+{
+	struct paradise_gyro_config_cmd cmd;
+
+	memset(&cmd, 0, sizeof(cmd));
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+	if (!cmd.type_mask)
+		cmd.type_mask = PARADISE_GYRO_MASK_ALL;
+
+	mutex_lock(&shanzi_gyro_lock);
+	shanzi_gyro_enabled = cmd.enable != 0;
+	shanzi_gyro_type_mask = cmd.type_mask;
+	shanzi_gyro_x = cmd.x;
+	shanzi_gyro_y = cmd.y;
+	cmd.enable = shanzi_gyro_enabled ? 1 : 0;
+	cmd.type_mask = shanzi_gyro_type_mask;
+	cmd.x = shanzi_gyro_x;
+	cmd.y = shanzi_gyro_y;
+	mutex_unlock(&shanzi_gyro_lock);
+
+	if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd)))
+		return -EFAULT;
+	return 0;
+}
+
+static long do_read_process_memory(unsigned long arg)
+{
+	struct paradise_memory_cmd cmd;
+	struct pid *kpid;
+	struct task_struct *task;
+	size_t done = 0;
+	uintptr_t first_phys = 0;
+	long ret = 0;
+	u8 stack_buf[SHANZI_READ_STACK_BUF_SIZE];
+	void *bounce = stack_buf;
+	size_t bounce_size = sizeof(stack_buf);
+
+	memset(&cmd, 0, sizeof(cmd));
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+	if (cmd.pid <= 0 || !cmd.src_va || !cmd.dst_va || !cmd.size)
+		return -EINVAL;
+	if (cmd.size > SHANZI_READ_MAX_SIZE)
+		return -EINVAL;
+
+	if (cmd.size > bounce_size) {
+		bounce_size = min_t(size_t, cmd.size, SHANZI_READ_MAX_SIZE);
+		bounce = kmalloc(bounce_size, GFP_KERNEL);
+		if (!bounce)
+			return -ENOMEM;
+	}
+
+	ret = lockfree_va_to_pa(cmd.pid, cmd.src_va, &first_phys);
+	if (!ret) {
+		cmd.phy_addr = first_phys;
+		if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd))) {
+			ret = -EFAULT;
+			goto out_free;
+		}
+	} else {
+		ret = 0;
+	}
+
+	kpid = find_get_pid(cmd.pid);
+	if (!kpid) {
+		ret = -ESRCH;
+		goto out_free;
+	}
+	task = get_pid_task(kpid, PIDTYPE_PID);
+	put_pid(kpid);
+	if (!task) {
+		ret = -ESRCH;
+		goto out_free;
+	}
+
+	while (done < cmd.size) {
+		size_t chunk = min_t(size_t, cmd.size - done, bounce_size);
+		int copied;
+
+		copied = access_process_vm(task, cmd.src_va + done, bounce,
+					   chunk, FOLL_FORCE);
+		if (copied <= 0) {
+			ret = -EFAULT;
+			break;
+		}
+		if (copy_to_user((void __user *)(cmd.dst_va + done), bounce,
+				 copied)) {
+			ret = -EFAULT;
+			break;
+		}
+		done += copied;
+		if ((size_t)copied != chunk) {
+			ret = -EFAULT;
+			break;
+		}
+	}
+	put_task_struct(task);
+
+out_free:
+	if (bounce != stack_buf)
+		kfree(bounce);
+	return ret;
+}
+
 static long do_read_physical_memory(unsigned long arg)
 {
 	struct paradise_memory_fast_cmd cmd;
@@ -2555,6 +3202,181 @@ out_free_bounce:
 	return ret;
 }
 
+static long do_write_process_memory_common(pid_t pid, uintptr_t dst_addr,
+					   uintptr_t user_buffer, size_t size,
+					   uintptr_t *phys_out)
+{
+	struct pid *kpid;
+	struct task_struct *task;
+	size_t done = 0;
+	long ret = 0;
+	u8 stack_buf[SHANZI_READ_STACK_BUF_SIZE];
+	void *bounce = stack_buf;
+	size_t bounce_size = sizeof(stack_buf);
+
+	if (pid <= 0 || !dst_addr || !user_buffer || !size)
+		return -EINVAL;
+	if (size > SHANZI_READ_MAX_SIZE)
+		return -EINVAL;
+
+	if (phys_out) {
+		ret = lockfree_va_to_pa(pid, dst_addr, phys_out);
+		if (ret)
+			return ret;
+	}
+
+	if (size > bounce_size) {
+		bounce_size = min_t(size_t, size, SHANZI_READ_MAX_SIZE);
+		bounce = kmalloc(bounce_size, GFP_KERNEL);
+		if (!bounce)
+			return -ENOMEM;
+	}
+
+	kpid = find_get_pid(pid);
+	if (!kpid) {
+		ret = -ESRCH;
+		goto out_free;
+	}
+	task = get_pid_task(kpid, PIDTYPE_PID);
+	put_pid(kpid);
+	if (!task) {
+		ret = -ESRCH;
+		goto out_free;
+	}
+
+	while (done < size) {
+		size_t chunk = min_t(size_t, size - done, bounce_size);
+		int copied;
+
+		if (copy_from_user(bounce, (void __user *)(user_buffer + done),
+				   chunk)) {
+			ret = -EFAULT;
+			break;
+		}
+
+		copied = access_process_vm(task, dst_addr + done, bounce, chunk,
+					   FOLL_FORCE | FOLL_WRITE);
+		if (copied <= 0) {
+			ret = -EFAULT;
+			break;
+		}
+		done += copied;
+		if ((size_t)copied != chunk) {
+			ret = -EFAULT;
+			break;
+		}
+	}
+	put_task_struct(task);
+
+out_free:
+	if (bounce != stack_buf)
+		kfree(bounce);
+	return ret;
+}
+
+static long do_write_process_memory(unsigned long arg)
+{
+	struct paradise_memory_cmd cmd;
+	uintptr_t phys = 0;
+	long ret;
+
+	memset(&cmd, 0, sizeof(cmd));
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+
+	ret = do_write_process_memory_common(cmd.pid, cmd.src_va, cmd.dst_va,
+					     cmd.size, NULL);
+	if (ret)
+		return ret;
+
+	lockfree_va_to_pa(cmd.pid, cmd.src_va, &phys);
+	cmd.phy_addr = phys;
+	if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd)))
+		return -EFAULT;
+	return 0;
+}
+
+static long do_write_physical_memory(unsigned long arg)
+{
+	struct paradise_memory_fast_cmd cmd;
+	pgprot_t prot;
+	uintptr_t phys = 0;
+	long ret;
+
+	memset(&cmd, 0, sizeof(cmd));
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+	if (convert_wmt_to_pgprot(cmd.prot, &prot))
+		return -EINVAL;
+
+	ret = do_write_process_memory_common(cmd.pid, cmd.src_va, cmd.dst_va,
+					     cmd.size, &phys);
+	if (ret)
+		return ret;
+
+	cmd.phy_addr = phys;
+	if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd)))
+		return -EFAULT;
+	return 0;
+}
+
+static long hello_ioctl_hide_path(unsigned long arg)
+{
+	struct paradise_hide_path_cmd cmd;
+	struct shanzi_hidden_path *hidden;
+	long ret;
+
+	memset(&cmd, 0, sizeof(cmd));
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+	cmd.path[sizeof(cmd.path) - 1] = '\0';
+	if (!cmd.path[0])
+		return -EINVAL;
+
+	ret = shanzi_resolve_hide_helpers();
+	if (ret)
+		return ret;
+
+	mutex_lock(&shanzi_path_hide_lock);
+	hidden = shanzi_find_hidden_path(cmd.path);
+	if (!cmd.hide) {
+		if (!hidden) {
+			mutex_unlock(&shanzi_path_hide_lock);
+			return -ESRCH;
+		}
+		list_del(&hidden->link);
+		mutex_unlock(&shanzi_path_hide_lock);
+		shanzi_cleanup_hidden_path(hidden);
+		SHZ_INFO("Shanzi: unhid path %s\n", cmd.path);
+		return 0;
+	}
+
+	if (hidden) {
+		mutex_unlock(&shanzi_path_hide_lock);
+		return 0;
+	}
+
+	hidden = kzalloc(sizeof(*hidden), GFP_KERNEL);
+	if (!hidden) {
+		mutex_unlock(&shanzi_path_hide_lock);
+		return -ENOMEM;
+	}
+	strscpy(hidden->path, cmd.path, sizeof(hidden->path));
+
+	ret = shanzi_hide_mount_tmpfs(hidden->path);
+	if (ret) {
+		kfree(hidden);
+		mutex_unlock(&shanzi_path_hide_lock);
+		return ret;
+	}
+
+	hidden->mounted = true;
+	list_add(&hidden->link, &shanzi_hidden_paths);
+	mutex_unlock(&shanzi_path_hide_lock);
+	SHZ_INFO("Shanzi: hid path %s\n", hidden->path);
+	return 0;
+}
+
 static long hello_ioctl_hide_process(unsigned long arg)
 {
 	struct paradise_hide_process_cmd cmd;
@@ -2663,12 +3485,27 @@ static long hello_unlocked_ioctl(struct file *file, unsigned int cmd,
 				 unsigned long arg)
 {
 	switch (cmd) {
+	case PARADISE_IOCTL_READ_MEMORY:
+		return do_read_process_memory(arg);
+	case PARADISE_IOCTL_WRITE_MEMORY:
+		return do_write_process_memory(arg);
 	case PARADISE_IOCTL_READ_MEMORY_FAST:
 		return do_read_physical_memory(arg);
+	case PARADISE_IOCTL_WRITE_MEMORY_FAST:
+		return do_write_physical_memory(arg);
+	case PARADISE_IOCTL_HIDE_PATH:
+		return hello_ioctl_hide_path(arg);
 	case PARADISE_IOCTL_HIDE_PROCESS:
 		return hello_ioctl_hide_process(arg);
+	case PARADISE_IOCTL_IS_PROCESS_ALIVE:
+		return hello_ioctl_is_process_alive(arg);
 	case SHANZI_IOCTL_HIDE_MODULE:
 		return shanzi_ioctl_hide_module(arg);
+	case PARADISE_IOCTL_LIST_PROCESSES_DECODED:
+	case PARADISE_IOCTL_LIST_PROCESSES:
+		return hello_ioctl_list_processes(arg);
+	case PARADISE_IOCTL_GYRO_CONFIG:
+		return hello_ioctl_gyro_config(arg);
 	case PARADISE_IOCTL_TOUCH_DOWN:
 		return hello_ioctl_touch_down(arg);
 	case PARADISE_IOCTL_TOUCH_MOVE:
@@ -2679,6 +3516,8 @@ static long hello_unlocked_ioctl(struct file *file, unsigned int cmd,
 		return hello_ioctl_touch_set_mode(arg);
 	case PARADISE_IOCTL_GET_MODULE_BASE:
 		return hello_ioctl_get_module_base(arg);
+	case PARADISE_IOCTL_GET_MODULE_RANGES:
+		return hello_ioctl_get_module_ranges(arg);
 	case PARADISE_IOCTL_GET_PID:
 		return hello_ioctl_get_pid(arg);
 	case SHANZI_IOCTL_HWBP_OPEN_PROCESS:
@@ -2755,12 +3594,22 @@ static int hello_release(struct inode *inode, struct file *file)
 	shanzi_cleanup_all_hwbp();
 	shanzi_cleanup_all_proc_handles();
 	shanzi_cleanup_all_hidden_procs();
+<<<<<<< HEAD
 	shanzi_cleanup_all_virtual_targets();
+=======
+	shanzi_cleanup_all_hidden_paths();
+>>>>>>> 87b0c5d (优化断点线程)
 	shanzi_pte_phys_cleanup();
 	memset(g_active_touches, 0, sizeof(g_active_touches));
 	g_touch_initialized = false;
 	g_touch_dev = NULL;
 	atomic64_set(&shanzi_hook_pc, 0);
+	mutex_lock(&shanzi_gyro_lock);
+	shanzi_gyro_enabled = false;
+	shanzi_gyro_type_mask = PARADISE_GYRO_MASK_ALL;
+	shanzi_gyro_x = 0.0f;
+	shanzi_gyro_y = 0.0f;
+	mutex_unlock(&shanzi_gyro_lock);
 	return 0;
 }
 
@@ -2776,42 +3625,155 @@ static const struct file_operations hello_fops = {
 #endif
 };
 
+static int shanzi_install_fd_to_current(int __user *out_fd)
+{
+	struct file *file;
+	int fd;
+
+	if (!out_fd)
+		return -EINVAL;
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+
+	file = anon_inode_getfile("paradise", &hello_fops, NULL, O_RDWR);
+	if (IS_ERR(file)) {
+		put_unused_fd(fd);
+		return PTR_ERR(file);
+	}
+
+	if (copy_to_user(out_fd, &fd, sizeof(fd))) {
+		fput(file);
+		put_unused_fd(fd);
+		return -EFAULT;
+	}
+
+	fd_install(fd, file);
+	return 0;
+}
+
+static void shanzi_install_fd_work_func(struct callback_head *head)
+{
+	struct shanzi_install_fd_work *work =
+		container_of(head, struct shanzi_install_fd_work, work);
+	int ret;
+
+	ret = shanzi_install_fd_to_current(work->out_fd);
+	if (ret)
+		SHZ_INFO("Shanzi: install fd failed: %d\n", ret);
+
+	kfree(work);
+}
+
+static int shanzi_supercall_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	struct shanzi_install_fd_work *work;
+	struct pt_regs *sys_regs = regs;
+	unsigned long magic1;
+	unsigned long magic2;
+	unsigned long out_ptr;
+	int ret;
+
+	if (shanzi_reboot_abi == SHANZI_SUPERCALL_ABI_PTREGS) {
+		sys_regs = (struct pt_regs *)regs->regs[0];
+		if (!sys_regs)
+			return 0;
+	}
+
+	magic1 = sys_regs->regs[0];
+	magic2 = sys_regs->regs[1];
+	out_ptr = sys_regs->regs[3];
+
+	if (magic1 != PARADISE_INSTALL_MAGIC1 ||
+	    magic2 != PARADISE_INSTALL_MAGIC2)
+		return 0;
+
+	work = kzalloc(sizeof(*work), GFP_ATOMIC);
+	if (!work) {
+		sys_regs->regs[0] = -ENOMEM;
+		return 0;
+	}
+
+	work->out_fd = (int __user *)out_ptr;
+	init_task_work(&work->work, shanzi_install_fd_work_func);
+	ret = shanzi_task_work_add_fn(current, &work->work, TWA_RESUME);
+	if (ret)
+		kfree(work);
+	sys_regs->regs[0] = ret;
+	return 0;
+}
+
+static int shanzi_supercalls_init(void)
+{
+	static const struct {
+		const char *symbol;
+		enum shanzi_supercall_abi abi;
+	} candidates[] = {
+		{ "__arm64_sys_reboot", SHANZI_SUPERCALL_ABI_PTREGS },
+		{ "__se_sys_reboot", SHANZI_SUPERCALL_ABI_DIRECT },
+		{ "sys_reboot", SHANZI_SUPERCALL_ABI_DIRECT },
+	};
+	int i;
+	int ret = -ENOENT;
+
+	if (!shanzi_task_work_add_fn)
+		shanzi_task_work_add_fn =
+			(void *)shanzi_lookup_symbol("task_work_add");
+	if (!shanzi_task_work_add_fn) {
+		SHZ_INFO("Shanzi: task_work_add not found\n");
+		return -ENOENT;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(candidates); i++) {
+		memset(&shanzi_reboot_kp, 0, sizeof(shanzi_reboot_kp));
+		shanzi_reboot_kp.symbol_name = candidates[i].symbol;
+		shanzi_reboot_kp.pre_handler = shanzi_supercall_pre;
+		shanzi_reboot_abi = candidates[i].abi;
+		ret = register_kprobe(&shanzi_reboot_kp);
+		if (!ret) {
+			shanzi_reboot_kp_registered = true;
+			SHZ_INFO("Shanzi: supercall/fd hooked %s\n",
+				 candidates[i].symbol);
+			return 0;
+		}
+	}
+
+	SHZ_INFO("Shanzi: reboot supercall kprobe failed: %d\n", ret);
+	return ret;
+}
+
+static void shanzi_supercalls_exit(void)
+{
+	if (!shanzi_reboot_kp_registered)
+		return;
+
+	unregister_kprobe(&shanzi_reboot_kp);
+	shanzi_reboot_kp_registered = false;
+}
+
 static int __init shanzi_init(void)
 {
 	int ret;
 
-	hello_major = register_chrdev(0, HELLO_DEVICE_NAME, &hello_fops);
-	if (hello_major < 0)
-		return hello_major;
-
-	hello_class = class_create(HELLO_DEVICE_NAME);
-	if (IS_ERR(hello_class)) {
-		ret = PTR_ERR(hello_class);
-		goto err_chrdev;
-	}
-
-	hello_device = device_create(hello_class, NULL, MKDEV(hello_major, 0), NULL,
-				     HELLO_DEVICE_NAME);
-	if (IS_ERR(hello_device)) {
-		ret = PTR_ERR(hello_device);
-		goto err_class;
-	}
+	ret = shanzi_supercalls_init();
+	if (ret)
+		return ret;
 
 	shanzi_hide_module_auto();
+<<<<<<< HEAD
 	if (shanzi_install_ptrace_virtualization())
 		SHZ_INFO("Shanzi: ptrace virtualization unavailable, continuing without it\n");
 	SHZ_INFO("Shanzi: loaded, device /dev/%s ready\n", HELLO_DEVICE_NAME);
+=======
+	SHZ_INFO("Shanzi: loaded, supercall/fd ready\n");
+>>>>>>> 87b0c5d (优化断点线程)
 	return 0;
-
-err_class:
-	class_destroy(hello_class);
-err_chrdev:
-	unregister_chrdev(hello_major, HELLO_DEVICE_NAME);
-	return ret;
 }
 
 static void __exit shanzi_exit(void)
 {
+<<<<<<< HEAD
 	if (shanzi_module_hidden && shanzi_module_prev) {
 		mutex_lock(&shanzi_module_hide_lock);
 		if (shanzi_module_hidden) {
@@ -2830,6 +3792,15 @@ static void __exit shanzi_exit(void)
 	device_destroy(hello_class, MKDEV(hello_major, 0));
 	class_destroy(hello_class);
 	unregister_chrdev(hello_major, HELLO_DEVICE_NAME);
+=======
+	shanzi_supercalls_exit();
+	if (hello_device)
+		device_destroy(hello_class, MKDEV(hello_major, 0));
+	if (hello_class && !IS_ERR(hello_class))
+		class_destroy(hello_class);
+	if (hello_major > 0)
+		unregister_chrdev(hello_major, HELLO_DEVICE_NAME);
+>>>>>>> 87b0c5d (优化断点线程)
 	shanzi_cleanup_all_hwbp();
 	shanzi_cleanup_all_proc_handles();
 	shanzi_cleanup_all_hidden_procs();
