@@ -1007,8 +1007,8 @@ struct shanzi_virtual_target {
 		if (fd < 0)
 			return LONG_MIN;
 
-		SHZ_INFO(
-			"Shanzi: perf_event_open virtualized tgid=%d pid=%d cpu=%d group_fd=%d flags=0x%lx addr=0x%llx len=%llu fd=%ld\n",
+		pr_info(
+			"Shanzi: perf_event_open intercepted tgid=%d pid=%d cpu=%d group_fd=%d flags=0x%lx addr=0x%llx len=%llu fd=%ld\n",
 			target_tgid, pid, cpu, group_fd, flags,
 			(unsigned long long)attr.bp_addr,
 			(unsigned long long)attr.bp_len, fd);
@@ -4151,7 +4151,7 @@ out_free:
 			return -EINVAL;
 
 		pfn = virt_to_phys(ctx->meta_page) >> PAGE_SHIFT;
-		vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 		if (remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE,
 				    vma->vm_page_prot))
 			return -EAGAIN;
